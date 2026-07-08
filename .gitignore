@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Experiment / run artifacts
+outputs/
+wandb/
+*.ckpt
+*.pt
+
+# Local scratch
+lewm_hpc_temp_conversation.md
+wandb_resume.json

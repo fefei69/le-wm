@@ -15,7 +15,7 @@ embed_dim: 192
 history_size: 3
 
 trainer:
-  max_epochs: 100
+  max_epochs: 10
   devices: auto
   accelerator: gpu
   precision: bf16
