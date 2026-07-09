@@ -4,13 +4,20 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.vscode/
 
 # Experiment / run artifacts
 outputs/
 wandb/
 *.ckpt
 *.pt
+checkpoints/
+/stable-wm
 
 # Local scratch
 lewm_hpc_temp_conversation.md
 wandb_resume.json
+
+# unrelated
+paper/
+DATASET_SPEC.md
