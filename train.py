@@ -44,14 +44,37 @@ def lejepa_forward(self, batch, stage, cfg):
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
 
+
+def resolve_dataset_name(name: str) -> str:
+    """Resolve repository-local datasets before stable-worldmodel dispatches.
+
+    ``stable_worldmodel.data.load_dataset`` resolves relative names below its
+    own dataset cache.  For experiment configs it is convenient to keep local
+    files under this repository's ``data/`` directory, so prefer a path
+    relative to Hydra's original working directory when that path exists.
+    Remote dataset identifiers remain unchanged.
+    """
+    path = Path(name).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    local_path = Path(hydra.utils.get_original_cwd(), path)
+    if local_path.exists():
+        return str(local_path.resolve())
+    return name
+
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
+    pl.seed_everything(cfg.seed, workers=True)
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+
     #########################
     ##       dataset       ##
     #########################
 
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
-    dataset_name = dataset_cfg.pop("name")
+    dataset_name = resolve_dataset_name(dataset_cfg.pop("name"))
     cache_dir = os.environ.get("LOCAL_DATASET_DIR", None)
     dataset = swm.data.load_dataset(
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
@@ -118,7 +141,9 @@ def run(cfg):
         OmegaConf.save(cfg, f)
 
     object_dump_callback = SaveCkptCallback(
-        run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=1,
+        run_name=cfg.output_model_name,
+        cfg=cfg.model,
+        epoch_interval=cfg.get("checkpoint_interval", 1),
     )
 
     trainer = pl.Trainer(
@@ -134,6 +159,7 @@ def run(cfg):
         trainer=trainer,
         module=world_model,
         data=data_module,
+        seed=cfg.seed,
         ckpt_path=ckpt_path if ckpt_path.exists() else None,
     )
 

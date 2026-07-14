@@ -70,6 +70,31 @@ python train.py data=pusht
 
 Checkpoints are saved to `$STABLEWM_HOME` upon completion.
 
+### Local push-box pilot
+
+The repository-local push-box dataset has a dedicated configuration with the
+collection rate preserved (`frameskip: 1`) and only the columns consumed by
+LeWM (`pixels` and `action`):
+
+```bash
+python train.py --config-name=pushbox
+```
+
+By default this reads `data/pushbox_keyboard_20260713.h5`, trains with batch
+size 64 for 100 epochs, and keeps Weights & Biases disabled. Point it at a
+different compatible HDF5 file or enable logging without editing the config:
+
+```bash
+PUSHBOX_DATASET=/absolute/path/to/pushbox.h5 \
+  python train.py --config-name=pushbox wandb.enabled=true
+```
+
+Portable model weights and their `config.json` are written to
+`$STABLEWM_HOME/checkpoints/pushbox_lewm/weights_epoch_<N>.pt` every 10 epochs
+and at the final epoch.
+Stable-pretraining's full-state resume checkpoints and CSV metrics are stored
+in the run-cache directory printed near the start of each training job.
+
 For baseline scripts, see the stable-worldmodel [scripts](https://github.com/galilai-group/stable-worldmodel/tree/main/scripts/train) folder.
 
 ## Planning

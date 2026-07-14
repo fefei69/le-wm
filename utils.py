@@ -44,11 +44,9 @@ class SaveCkptCallback(Callback):
         super().on_train_epoch_end(trainer, pl_module)
 
         if trainer.is_global_zero:
-            if (trainer.current_epoch + 1) % self.epoch_interval == 0:
-                self._save(pl_module.model, trainer.current_epoch + 1)
-
-            if (trainer.current_epoch + 1) == trainer.max_epochs:
-                self._save(pl_module.model, trainer.current_epoch + 1)
+            epoch = trainer.current_epoch + 1
+            if epoch % self.epoch_interval == 0 or epoch == trainer.max_epochs:
+                self._save(pl_module.model, epoch)
 
     def _save(self, model, epoch):
         from stable_worldmodel.wm.utils import save_pretrained
