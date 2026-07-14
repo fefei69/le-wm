@@ -13,6 +13,7 @@ wandb/
 *.pt
 checkpoints/
 /stable-wm
+*.out
 
 # Local scratch
 lewm_hpc_temp_conversation.md

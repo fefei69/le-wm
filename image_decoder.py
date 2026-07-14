@@ -7,7 +7,7 @@ import torch.nn as nn
 class CLSDecoder(nn.Module):
     def __init__(
         self,
-        cls_dim=384,
+        cls_dim=192,
         img_size=224,
         patch_size=16,
         dim=256,
@@ -16,6 +16,7 @@ class CLSDecoder(nn.Module):
     ):
         super().__init__()
 
+        assert img_size % patch_size == 0, "img_size must be divisible by patch_size"
         self.num_patches = (img_size // patch_size) ** 2
         patch_dim = patch_size * patch_size * 3
 
