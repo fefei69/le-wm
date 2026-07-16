@@ -22,3 +22,7 @@ wandb_resume.json
 # unrelated
 paper/
 DATASET_SPEC.md
+
+
+# Datasets
+data/
