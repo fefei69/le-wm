@@ -70,28 +70,36 @@ python train.py data=pusht
 
 Checkpoints are saved to `$STABLEWM_HOME` upon completion.
 
-### Local push-box pilot
+### PushBox training pipeline
 
-The repository-local push-box dataset has a dedicated configuration with the
-collection rate preserved (`frameskip: 1`) and only the columns consumed by
-LeWM (`pixels` and `action`):
+The merged PushBox dataset lives at
+`$STABLEWM_HOME/datasets/pushbox_pilot_train.h5`. It contains 227 episodes,
+74,531 transitions, and 73,850 valid four-frame clips at the original 5 Hz
+collection rate. The dedicated configuration uses `frameskip: 1` and loads the
+two columns consumed by LeWM (`pixels` and `action`):
 
 ```bash
 python train.py --config-name=pushbox
 ```
 
-By default this reads `data/pushbox_keyboard_20260713.h5`, trains with batch
-size 64 for 100 epochs, and keeps Weights & Biases disabled. Point it at a
-different compatible HDF5 file or enable logging without editing the config:
+The split keeps episodes atomic while balancing the validation set by usable
+clip count. By default, training uses batch size 128 for 150 epochs and logs
+training and validation losses to Weights & Biases. Point it at a different
+compatible HDF5 file without editing the config:
 
 ```bash
 PUSHBOX_DATASET=/absolute/path/to/pushbox.h5 \
-  python train.py --config-name=pushbox wandb.enabled=true
+  python train.py --config-name=pushbox
 ```
 
 Portable model weights and their `config.json` are written to
-`$STABLEWM_HOME/checkpoints/pushbox_lewm/weights_epoch_<N>.pt` every 10 epochs
-and at the final epoch.
+`$STABLEWM_HOME/checkpoints/pushbox/lewm/weights_epoch_<N>.pt`. To submit the
+world-model job and a decoder job that starts only after successful training:
+
+```bash
+bash scripts/submit_pushbox_pipeline.sh
+```
+
 Stable-pretraining's full-state resume checkpoints and CSV metrics are stored
 in the run-cache directory printed near the start of each training job.
 

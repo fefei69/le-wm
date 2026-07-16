@@ -4,9 +4,9 @@ defaults:
   - model: lewm
   - _self_
 
-output_model_name: pushbox_lewm
-subdir: pushbox_lewm
-checkpoint_interval: 10
+output_model_name: pushbox/lewm
+subdir: pushbox-lewm
+checkpoint_interval: 1
 
 num_workers: 6
 train_split: 0.9
@@ -16,18 +16,16 @@ embed_dim: 192
 history_size: 3
 
 trainer:
-  # The local pilot has about 6.3k four-frame windows. At batch size 64,
-  # 100 epochs gives roughly 8.8k optimizer steps.
-  max_epochs: 100
+  # There are 66,468 training clips after the deterministic episode-level
+  # split. At batch size 128, 150 epochs gives about 78k optimizer steps.
+  max_epochs: 150
   devices: auto
   accelerator: gpu
   precision: bf16-mixed
   gradient_clip_val: 1.0
 
 loader:
-  # Batch size 64 was verified with a bf16 forward/backward pass on the local
-  # 16 GB RTX 5080. Spawn avoids the installed Lance runtime's fork warning.
-  batch_size: 64
+  batch_size: 128
   num_workers: ${num_workers}
   persistent_workers: true
   prefetch_factor: 3

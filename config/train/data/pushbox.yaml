@@ -1,7 +1,10 @@
+split_by_episode: true
+split_search_trials: 50000
+
 dataset:
   num_steps: ${eval:'${num_preds} + ${history_size}'}
   frameskip: 1
-  name: ${oc.env:PUSHBOX_DATASET,data/pushbox_keyboard_20260713.h5}
+  name: ${oc.env:PUSHBOX_DATASET,pushbox_pilot_train.h5}
   keys_to_load:
     - pixels
     - action

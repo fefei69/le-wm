@@ -11,7 +11,12 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from module import SIGReg
-from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
+from utils import (
+    SaveCkptCallback,
+    balanced_episode_split,
+    get_column_normalizer,
+    get_img_preprocessor,
+)
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -79,27 +84,68 @@ def run(cfg):
     dataset = swm.data.load_dataset(
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
-    transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
+    episode_split = None
+    normalizer_episodes = None
+    if cfg.data.get("split_by_episode", False):
+        episode_split = balanced_episode_split(
+            dataset,
+            train_fraction=cfg.train_split,
+            seed=cfg.seed,
+            search_trials=cfg.data.get("split_search_trials", 50_000),
+        )
+        normalizer_episodes = episode_split.train_episode_indices
+        print(
+            "Episode-grouped split: "
+            f"train={len(episode_split.train_episode_indices)} episodes/"
+            f"{len(episode_split.train_clip_indices)} clips, "
+            f"validation={len(episode_split.val_episode_indices)} episodes/"
+            f"{len(episode_split.val_clip_indices)} clips "
+            f"({len(episode_split.val_clip_indices) / len(dataset):.2%}); "
+            f"validation episode ids={episode_split.val_episode_indices.tolist()}"
+        )
+    transforms = [
+        get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)
+    ]
     
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
                 continue
-            normalizer = get_column_normalizer(dataset, col, col)
+            normalizer = get_column_normalizer(
+                dataset, col, col, episode_indices=normalizer_episodes
+            )
             transforms.append(normalizer)
 
-        cfg.model.action_encoder.input_dim = cfg.data.dataset.frameskip * dataset.get_dim("action")
+        cfg.model.action_encoder.input_dim = (
+            cfg.data.dataset.frameskip * dataset.get_dim("action")
+        )
 
     transform = spt.data.transforms.Compose(*transforms)
     dataset.transform = transform
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
-    train_set, val_set = spt.data.random_split(
-        dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
-    )
+    if episode_split is None:
+        train_set, val_set = spt.data.random_split(
+            dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
+        )
+    else:
+        train_set = torch.utils.data.Subset(
+            dataset, episode_split.train_clip_indices.tolist()
+        )
+        val_set = torch.utils.data.Subset(
+            dataset, episode_split.val_clip_indices.tolist()
+        )
 
-    train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
-    val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
+    train = torch.utils.data.DataLoader(
+        train_set,
+        **cfg.loader,
+        shuffle=True,
+        drop_last=True,
+        generator=rnd_gen,
+    )
+    val = torch.utils.data.DataLoader(
+        val_set, **cfg.loader, shuffle=False, drop_last=False
+    )
     
     ##############################
     ##       model / optim      ##
