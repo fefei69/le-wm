@@ -107,14 +107,16 @@ For baseline scripts, see the stable-worldmodel [scripts](https://github.com/gal
 
 ## Planning
 
-Evaluation configs live under `config/eval/`. Set the `policy` field to the checkpoint path **relative to `$STABLEWM_HOME`**, without the `_object.ckpt` suffix:
+Evaluation configs live under `config/eval/`. Set `policy` either to a public
+Hugging Face model repo or to a local `.pt` checkpoint path relative to
+`$STABLEWM_HOME/checkpoints`:
 
 ```bash
-# ✓ correct
-python eval.py --config-name=pusht.yaml policy=pusht/lewm
+# Public pretrained PushT LeWM checkpoint
+python eval.py --config-name=pusht policy=quentinll/lewm-pusht
 
-# ✗ incorrect
-python eval.py --config-name=pusht.yaml policy=pusht/lewm_object.ckpt
+# Local checkpoint
+python eval.py --config-name=pusht policy=lewm/weights_epoch_10.pt
 ```
 
 ## Pretrained Checkpoints

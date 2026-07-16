@@ -14,6 +14,54 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
+
+_LEGACY_VIT_KEY_RENAMES = (
+    ("encoder.encoder.layer.", "encoder.layers."),
+    (".attention.attention.query.", ".attention.q_proj."),
+    (".attention.attention.key.", ".attention.k_proj."),
+    (".attention.attention.value.", ".attention.v_proj."),
+    (".attention.output.dense.", ".attention.o_proj."),
+    (".intermediate.dense.", ".mlp.fc1."),
+    (".output.dense.", ".mlp.fc2."),
+)
+
+
+def load_pretrained(policy: str):
+    """Load a checkpoint, adapting legacy Hugging Face ViT parameter names."""
+    try:
+        return swm.wm.utils.load_pretrained(policy)
+    except RuntimeError as error:
+        message = str(error)
+        if (
+            "encoder.encoder.layer." not in message
+            or "encoder.layers." not in message
+        ):
+            raise
+
+    # Transformers renamed ViT encoder parameters between the checkpoint's
+    # release and the currently installed version. The model architecture and
+    # tensor shapes are unchanged, so load strictly after translating names.
+    from stable_worldmodel.wm import utils as wm_utils
+
+    checkpoint_root = wm_utils.get_cache_dir(sub_folder="checkpoints")
+    checkpoint_path, model_config = wm_utils._resolve(policy, checkpoint_root)
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+    remapped_state_dict = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for old, new in _LEGACY_VIT_KEY_RENAMES:
+            new_key = new_key.replace(old, new)
+        if new_key in remapped_state_dict:
+            raise RuntimeError(f"Duplicate checkpoint key after remapping: {new_key}")
+        remapped_state_dict[new_key] = value
+
+    model = hydra.utils.instantiate(model_config)
+    model.load_state_dict(remapped_state_dict, strict=True)
+    print("Loaded checkpoint after translating legacy ViT parameter names.")
+    return model
+
+
 def img_transform(cfg):
     transform = transforms.Compose(
         [
@@ -85,7 +133,7 @@ def run(cfg: DictConfig):
     policy = cfg.get("policy", "random")
 
     if policy != "random":
-        model = swm.wm.utils.load_pretrained(cfg.policy)
+        model = load_pretrained(cfg.policy)
         model = model.to("cuda")
         model = model.eval()
         model.requires_grad_(False)
