@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "manifest_type": "real_robot_eval",
+  "world_model": {
+    "checkpoint": "checkpoints/pushbox/lewm/weights_epoch_146.pt",
+    "checkpoint_sha256": "510306be771177621df55d5772f083b973985cb3692a2fcd9a662cfcba3f1e99"
+  },
+  "dataset": {
+    "path": "datasets/pushbox_pilot_train.h5",
+    "sha256": "d445328a26a497e11da7f114694c71923790182f1e277dc103be28c05cd7941d"
+  },
+  "collector": {
+    "transform_profile_sha256": "4099776328d4d0e7810542abe138e7f3db3059f1957f364e1b46481032afe5cb",
+    "camera_params_sha256": "106a43828f4873a2005f143ea4b23f0597f7d55388a120fbf7cdbe60435bbfa5"
+  },
+  "split": {
+    "train_fraction": 0.9,
+    "seed": 3072,
+    "search_trials": 50000
+  },
+  "normalization": {
+    "action": {
+      "mean": [
+        0.0008265739306807518,
+        -0.00008000325033208355
+      ],
+      "std": [
+        0.0036483430303633213,
+        0.003874549875035882
+      ],
+      "sample_std": true
+    }
+  },
+  "runtime": {
+    "history_size": 3,
+    "latent_dim": 192,
+    "action_dim": 2,
+    "frameskip": 1,
+    "tick_hz": 5.0,
+    "image_shape_chw": [3, 224, 224],
+    "raw_action_units": "meters_per_control_step",
+    "maximum_action_norm_m": 0.01,
+    "action_axes": {
+      "up": "+x",
+      "down": "-x",
+      "left": "+y",
+      "right": "-y"
+    }
+  }
+}

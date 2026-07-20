@@ -9,15 +9,19 @@ venv/
 # Experiment / run artifacts
 outputs/
 wandb/
+real_robot_runs/
 *.ckpt
 *.pt
 checkpoints/
 /stable-wm
 *.out
+*.mp4
 
 # Local scratch
 lewm_hpc_temp_conversation.md
 wandb_resume.json
+sync_paper.sh
+
 
 # unrelated
 paper/
@@ -26,3 +30,4 @@ DATASET_SPEC.md
 
 # Datasets
 data/
+datasets_videos/

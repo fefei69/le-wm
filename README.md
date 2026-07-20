@@ -119,6 +119,97 @@ python eval.py --config-name=pusht policy=quentinll/lewm-pusht
 python eval.py --config-name=pusht policy=lewm/weights_epoch_10.pt
 ```
 
+### Real PushBox planning
+
+The real-robot evaluator reuses the camera transform, Cartesian startup pose,
+fixed height, arrow controls, and shutdown sequence from the sibling
+`wm_data_collection` repository. The controller runs with ROS-compatible Python
+3.12 while LeWM planning runs in this repository's virtual environment over a
+local authenticated Unix socket.
+
+The configured launcher defaults to **live robot execution** with the
+commissioned start pose and X/Y bounds in `scripts/eval_pushbox_real.sh`.
+Validate it first, then use its explicit dry-run mode to open the camera and
+planner without connecting to or commanding the arm:
+
+```bash
+scripts/eval_pushbox_real.sh --dry-run --preflight
+scripts/eval_pushbox_real.sh --dry-run
+```
+
+The default model is `pushbox/lewm/weights_epoch_146.pt`, selected by validation
+prediction loss. Controls are:
+
+- Arrow keys: manual XY motion while autonomous execution is paused.
+- `1`, `2`, `3`: select the same 2.5, 5, or 10 mm manual step as collection.
+- `g`: capture the current transformed camera frame as a new trial goal.
+- `v`: compute a preview plan from the current scene without moving the arm.
+- `p`: start or pause autonomous planning and execution.
+- `SPACE`: cancel autonomous/manual motion by holding the measured pose.
+- `r`: return the arm to the configured start XY while paused.
+- `s` / `f`: label the active trial as success or failure.
+- `q` or window close: pause, then run the collector's home-to-zero shutdown;
+  after a latched fault, automatic recovery motion is deliberately skipped.
+
+A safe goal workflow is: manually arrange the desired scene, press `g`, reset
+the box and arm to the evaluation start, press `v` to inspect the proposed plan,
+then press `p`. Focus loss, stale/over-age planning input, planner failure,
+measured pose deviation, a blocked workspace action, or the maximum per-trial
+action count pauses execution. A paused trial retains its action count; capture
+a new goal to start a new budget.
+
+Every interactive invocation writes a timestamped directory under
+`real_robot_runs/` containing resolved metadata, flushed JSONL events, goal and
+planning frames as lossless RGB PNG images, complete plans, timing,
+requested/accepted/executed actions, measured poses, and the final outcome.
+Autonomous control is one-step receding-horizon MPC: only the first action of
+each CEM plan is sent. Before encoding the next observation, the evaluator
+waits for the arm to reach its target and fall below the configured settled
+speed, then requires a camera frame received strictly after that verification.
+By default, `--action-mode keyboard` restricts every CEM candidate to the exact
+zero/8-way actions used by the collector at the enabled 2.5, 5, and 10 mm
+magnitudes. The selected `--action-cap` removes larger magnitudes; for example,
+`--action-cap 0.005` searches 17 actions (zero plus eight directions at 2.5 and
+5 mm). Use `--action-mode continuous` only for an explicit A/B comparison.
+The default checkpoint, dataset, normalization, camera parameters, and image
+transform are checked against
+`config/real_robot_eval.json`; `--allow-artifact-mismatch` is an explicit
+commissioning-only override.
+
+Recorded trials can be replayed without the robot. This re-encodes each saved
+PNG, reconstructs the exact three-state/action planner context, rolls out the
+recorded selected CEM plan, and decodes one predicted image per horizon step:
+
+```bash
+.venv/bin/python scripts/replay_real_cem_latents.py \
+  --run real_robot_runs/20260717_202906_1203310 \
+  --plan-step 1 --plan-step 10 --plan-step 20 --plan-step 30
+```
+
+The generated `outputs/real_cem_latent_replay_<run>/index.html` links contact
+sheets, raw latent arrays, per-step metrics, and an actual goal-distance plot.
+For horizon 10, each selected plan contains `predicted_001.png` through
+`predicted_010.png`. Only prediction 1 is directly comparable with the next
+real observation because the live controller replans after every action. The
+tool refuses a decoder trained against a different world-model checkpoint by
+default.
+
+After checking the physical workspace and keeping the emergency stop ready,
+start the configured live launcher with:
+
+```bash
+scripts/eval_pushbox_real.sh
+```
+
+The launcher currently uses start XY `(0.14, 0.0185)` m, safe/fixed Z
+`0.15/0.03` m, X bounds `[0.0183, 0.45]` m, and Y bounds `[-0.26, 0.26]` m.
+Its `0.1 m/s` settled-speed value is a post-command observation gate, not a
+commanded-velocity limit; ordinary paused and manual pose checks do not treat
+instantaneous Cartesian velocity as a latched fault.
+Command-line values appended to the launcher override these configured values.
+Run dry mode first and confirm planner latency is comfortably below the intended
+control cadence before enabling motion.
+
 ## Pretrained Checkpoints
 
 Pretrained LeWM checkpoints for each environment are mirrored on the Hugging Face
