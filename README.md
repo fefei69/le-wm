@@ -127,6 +127,10 @@ fixed height, arrow controls, and shutdown sequence from the sibling
 3.12 while LeWM planning runs in this repository's virtual environment over a
 local authenticated Unix socket.
 
+See [the dated implementation summary](docs/real_robot_eval.md) for the runtime
+architecture, safety behavior, planner changes, run-record format, and offline
+diagnostic tools added on July 20, 2026.
+
 The configured launcher defaults to **live robot execution** with the
 commissioned start pose and X/Y bounds in `scripts/eval_pushbox_real.sh`.
 Validate it first, then use its explicit dry-run mode to open the camera and
