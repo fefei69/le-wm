@@ -141,6 +141,24 @@ scripts/eval_pushbox_real.sh --dry-run --preflight
 scripts/eval_pushbox_real.sh --dry-run
 ```
 
+Instead of capturing a goal with `g`, open a recorded dataset video in the goal
+frame selector. This happens before the planner, camera, or robot starts:
+
+```bash
+scripts/eval_pushbox_real.sh \
+  --goal-video datasets_videos/20260714_145344/ep_000.mp4
+```
+
+In the selector, use Left/Right to move, press `1` or `5` to choose the number
+of frames skipped per key press, and press Enter to confirm. `Esc`, `q`, or
+closing the window cancels before hardware access. For a scripted run, bypass
+the UI with `--goal-video-frame 42`; preflight runs require this explicit frame
+index because `--preflight` never opens a display.
+
+An already-extracted 224x224 RGB frame can be supplied with `--goal-image`.
+Relative goal paths are resolved from this repository even though the hardware
+process launches from the sibling collector repository.
+
 The default model is `pushbox/lewm/weights_epoch_146.pt`, selected by validation
 prediction loss. Controls are:
 
@@ -165,7 +183,10 @@ a new goal to start a new budget.
 Every interactive invocation writes a timestamped directory under
 `real_robot_runs/` containing resolved metadata, flushed JSONL events, goal and
 planning frames as lossless RGB PNG images, complete plans, timing,
-requested/accepted/executed actions, measured poses, and the final outcome.
+requested/accepted/executed actions, measured poses, and the final outcome. For
+every executed autonomous action it also saves projected encoder `z[t]` under
+`latents/z/` and the one-step predictor result `z_hat[t+1]` under
+`latents/z_hat/`, conditioned on the accepted physical XY action.
 Autonomous control is one-step receding-horizon MPC: only the first action of
 each CEM plan is sent. Before encoding the next observation, the evaluator
 waits for the arm to reach its target and fall below the configured settled
@@ -197,6 +218,21 @@ For horizon 10, each selected plan contains `predicted_001.png` through
 real observation because the live controller replans after every action. The
 tool refuses a decoder trained against a different world-model checkpoint by
 default.
+
+New runs with live latent artifacts can be rendered directly as a time-aligned
+three-row figure:
+
+```bash
+.venv/bin/python scripts/render_real_latent_alignment.py \
+  --run real_robot_runs/RUN_ID \
+  --trial-id 1
+```
+
+The rows are raw `observation[t]`, `decoder(z[t])`, and
+`decoder(z_hat[t])`. The first cell in the prediction row is empty; every later
+prediction is shifted under the real next observation it predicts. The final
+saved prediction has no later real frame to align with and remains available in
+the generated `decoded_z_hat/` directory.
 
 After checking the physical workspace and keeping the emergency stop ready,
 start the configured live launcher with:

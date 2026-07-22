@@ -418,6 +418,30 @@ class PushBoxPlanner:
         return cost
 
     @torch.inference_mode()
+    def predict_next_latent(self, action: Any) -> dict[str, np.ndarray]:
+        """Predict one transition from the current MPC context without mutation."""
+        if self._latent_context is None:
+            raise RuntimeError("cannot predict a transition before planning")
+        raw_action = np.asarray(action, dtype=np.float32)
+        if raw_action.shape != (ACTION_DIM,) or not np.isfinite(raw_action).all():
+            raise ValueError("transition action must be a finite XY delta")
+        if float(np.linalg.norm(raw_action)) > self.config.action_cap_m + 1e-7:
+            raise ValueError("transition action exceeds the configured action cap")
+        action_tensor = torch.as_tensor(
+            raw_action, dtype=torch.float32, device=self.device
+        ).reshape(1, 1, ACTION_DIM)
+        trajectory = self._rollout_latents(self._latent_context, action_tensor)[0]
+        encoded = trajectory[0].detach().cpu().numpy().astype(np.float32)
+        predicted = trajectory[1].detach().cpu().numpy().astype(np.float32)
+        if not np.isfinite(encoded).all() or not np.isfinite(predicted).all():
+            raise RuntimeError("transition prediction produced a non-finite latent")
+        return {
+            "encoded_latent": encoded,
+            "predicted_next_latent": predicted,
+            "prediction_action": raw_action.copy(),
+        }
+
+    @torch.inference_mode()
     def plan(
         self,
         current: np.ndarray,
@@ -595,6 +619,15 @@ def serve(args: argparse.Namespace) -> int:
                 if operation == "reset":
                     planner.reset()
                     connection.send({"ok": True})
+                    continue
+                if operation == "predict_next":
+                    try:
+                        result = planner.predict_next_latent(request["action"])
+                        connection.send({"ok": True, **result})
+                    except Exception as exc:
+                        connection.send(
+                            {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                        )
                     continue
                 if operation != "plan":
                     connection.send(

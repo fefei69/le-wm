@@ -29,6 +29,8 @@ The evaluator now provides:
   action magnitudes used during data collection;
 - goal capture, plan preview, autonomous start/pause, reset, success/failure
   labels, and controlled shutdown;
+- optional startup goals loaded from a 224x224 image or an explicitly indexed
+  frame in a dataset MP4;
 - one-step receding-horizon MPC: CEM plans a full horizon, but only its first
   action is executed before observing and replanning;
 - finite workspace, pose, orientation, action-norm, planner-age, camera-age,
@@ -91,6 +93,8 @@ Every invocation creates a timestamped directory under `real_robot_runs/` with:
 - requested, accepted, executed, and planner-feedback actions;
 - complete selected CEM plans, measured poses, latent goal distance, and solver
   latency.
+- projected observation latents in `latents/z/` and accepted-action-conditioned
+  one-step predictions in `latents/z_hat/` for every executed autonomous step.
 
 `real_robot_runs/` and derived `outputs/` remain ignored by Git so hardware data
 and large diagnostic artifacts are not accidentally committed.
@@ -100,6 +104,7 @@ and large diagnostic artifacts are not accidentally committed.
 | Tool | Purpose |
 | --- | --- |
 | `scripts/replay_real_cem_latents.py` | Re-encode recorded PNGs, reconstruct planner history, replay each selected CEM plan, decode every predicted horizon state, and report predicted-versus-real one-step errors. |
+| `scripts/render_real_latent_alignment.py` | Decode saved live `z`/`z_hat` arrays and create the three-row time-aligned raw/encoded/predicted figure. |
 | `scripts/probe_pushbox_latent_rollout.py` | Apply a constant synthetic XY action from one real image and decode the open-loop latent trajectory. |
 | `scripts/record_real_constant_xy.py` | Safely record a real constant-XY robot trajectory with aligned pre/post-action images and measured states. |
 | `scripts/analyze_real_latent_rollout.py` | Compare encoded real frames with the corresponding predicted latent rollout and generate plots, tables, and video. |
@@ -144,6 +149,20 @@ scripts/eval_pushbox_real.sh \
   --max-actions 100
 ```
 
+Interactively select a goal from a dataset episode before the original runtime
+pipeline starts:
+
+```bash
+scripts/eval_pushbox_real.sh \
+  --goal-video datasets_videos/20260714_145344/ep_000.mp4
+```
+
+The selector uses Left/Right for navigation. Press `1` or `5` to set its skip
+mode and Enter to confirm the displayed frame. `Esc`, `q`, or window close
+cancels without starting the planner, camera, or robot. Add
+`--goal-video-frame 42` to bypass the selector; this explicit form is required
+when combining a video goal with `--preflight`.
+
 Replay selected plans from a recorded run:
 
 ```bash
@@ -151,6 +170,17 @@ Replay selected plans from a recorded run:
   --run real_robot_runs/RUN_ID \
   --plan-step 1 --plan-step 10 --plan-step 20
 ```
+
+Render the saved live one-step predictions beneath their target timestamps:
+
+```bash
+scripts/run_real_plus_x_latent_probe.sh real_robot_runs/RUN_ID
+```
+
+The wrapper detects normal evaluation runs with saved `z`/`z_hat` artifacts and
+uses the three-row alignment renderer. Options after the run directory are
+forwarded to it, for example `--trial-id 2` or `--device cpu`. It still detects
+and analyzes its original constant-XY recorder format as before.
 
 ### Verification status
 
@@ -160,5 +190,5 @@ As of July 20, 2026:
 - the epoch-146 planner loads against the artifact manifest;
 - constrained CEM outputs were verified to contain only exact keyboard-action
   vocabulary entries;
-- all 21 real-evaluation and constant-trajectory unit tests pass.
-
+- all 25 real-evaluation, latent-alignment, and constant-trajectory unit tests
+  pass.

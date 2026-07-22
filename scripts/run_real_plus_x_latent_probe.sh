@@ -5,11 +5,20 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 collector_repo="${WM_DATA_COLLECTION_REPO:-$(cd "$repo_root/../wm_data_collection" && pwd)}"
 recorder="$repo_root/scripts/record_real_constant_xy.py"
 analyzer="$repo_root/scripts/analyze_real_latent_rollout.py"
+alignment_renderer="$repo_root/scripts/render_real_latent_alignment.py"
 analysis_python="$repo_root/.venv/bin/python"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/run_real_plus_x_latent_probe.sh [--preflight|--dry-run|--execute] [RECORDER_ARGS...]
+Usage:
+  scripts/run_real_plus_x_latent_probe.sh REAL_ROBOT_RUN [ANALYSIS_ARGS...]
+  scripts/run_real_plus_x_latent_probe.sh --run REAL_ROBOT_RUN [ANALYSIS_ARGS...]
+  scripts/run_real_plus_x_latent_probe.sh [--preflight|--dry-run|--execute] [RECORDER_ARGS...]
+
+When an existing run directory is supplied, analyze it without opening the
+camera or robot. Normal evaluation runs use the saved-latent alignment renderer;
+constant-XY probe runs use the original rollout analyzer. Analysis arguments are
+forwarded to the selected analyzer (for example, --trial-id 2 or --device cpu).
 
 The default is a no-robot preflight. Pass --execute explicitly to enable the
 live recording; all other arguments are forwarded unchanged to the recorder.
@@ -19,6 +28,66 @@ Environment:
   WM_DATA_COLLECTION_REPO  Override the sibling wm_data_collection repository.
 EOF
 }
+
+existing_run=""
+analysis_args=()
+if (($#)) && [[ "$1" == --run ]]; then
+    if (($# < 2)); then
+        echo "--run requires an experiment directory" >&2
+        exit 2
+    fi
+    existing_run="$2"
+    shift 2
+    analysis_args=("$@")
+elif (($#)) && [[ "$1" != -* ]]; then
+    existing_run="$1"
+    shift
+    analysis_args=("$@")
+fi
+
+if [[ -n "$existing_run" ]]; then
+    if [[ ! -d "$existing_run" ]]; then
+        echo "experiment directory not found: $existing_run" >&2
+        exit 1
+    fi
+    existing_run="$(cd "$existing_run" && pwd)"
+    if [[ ! -x "$analysis_python" ]]; then
+        echo "analysis Python was not found: $analysis_python" >&2
+        exit 1
+    fi
+    if [[ ! -f "$existing_run/metadata.json" || ! -f "$existing_run/events.jsonl" || ! -d "$existing_run/frames" ]]; then
+        echo "experiment must contain metadata.json, events.jsonl, and frames/: $existing_run" >&2
+        exit 1
+    fi
+
+    if [[ -f "$existing_run/frames/frame_000.png" ]]; then
+        if [[ ! -f "$analyzer" ]]; then
+            echo "real latent-rollout analyzer not found: $analyzer" >&2
+            exit 1
+        fi
+        echo "Analyzing existing constant-XY probe: $existing_run"
+        (
+            cd "$repo_root"
+            env -u PYTHONPATH "$analysis_python" "$analyzer" \
+                --real-run "$existing_run" "${analysis_args[@]}"
+        )
+    elif [[ -d "$existing_run/latents/z" && -d "$existing_run/latents/z_hat" ]]; then
+        if [[ ! -f "$alignment_renderer" ]]; then
+            echo "real latent-alignment renderer not found: $alignment_renderer" >&2
+            exit 1
+        fi
+        echo "Rendering saved latent alignment for: $existing_run"
+        (
+            cd "$repo_root"
+            env -u PYTHONPATH "$analysis_python" "$alignment_renderer" \
+                --run "$existing_run" "${analysis_args[@]}"
+        )
+    else
+        echo "unrecognized experiment format (no constant frames or saved z/z_hat latents): $existing_run" >&2
+        exit 1
+    fi
+    exit 0
+fi
 
 mode=preflight
 recorder_args=()

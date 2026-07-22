@@ -104,6 +104,31 @@ def validate_planner_result(
     )
 
 
+def validate_transition_prediction(
+    result: dict[str, Any], *, action: Any, latent_dim: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate the saved causal pair ``z[t] -> z_hat[t+1]``."""
+    expected_action = np.asarray(action, dtype=np.float32)
+    if expected_action.shape != (2,) or not np.isfinite(expected_action).all():
+        raise ValueError("transition action must be a finite XY delta")
+    returned_action = np.asarray(result["prediction_action"], dtype=np.float32)
+    if returned_action.shape != (2,) or not np.allclose(
+        returned_action, expected_action, rtol=0.0, atol=1e-8
+    ):
+        raise ValueError("transition prediction used a different action")
+    encoded = np.asarray(result["encoded_latent"], dtype=np.float32)
+    predicted = np.asarray(result["predicted_next_latent"], dtype=np.float32)
+    expected_shape = (int(latent_dim),)
+    if encoded.shape != expected_shape or predicted.shape != expected_shape:
+        raise ValueError(
+            f"transition latents must both have shape {expected_shape}, got "
+            f"{encoded.shape} and {predicted.shape}"
+        )
+    if not np.isfinite(encoded).all() or not np.isfinite(predicted).all():
+        raise ValueError("transition latents must be finite")
+    return encoded, predicted
+
+
 def validate_measured_pose(
     pose: Any,
     *,
@@ -204,6 +229,210 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+@dataclass
+class GoalFrameSelectorState:
+    """Testable navigation state for the dataset-video goal selector."""
+
+    frame_count: int
+    frame_index: int = 0
+    stride: int = 1
+
+    def __post_init__(self) -> None:
+        if self.frame_count < 1:
+            raise ValueError("goal video must contain at least one frame")
+        if not 0 <= self.frame_index < self.frame_count:
+            raise ValueError("initial goal frame is outside the video")
+        self.set_stride(self.stride)
+
+    def set_stride(self, stride: int) -> None:
+        if stride not in (1, 5):
+            raise ValueError("goal frame selector stride must be 1 or 5")
+        self.stride = int(stride)
+
+    def move(self, direction: int) -> bool:
+        """Move one active stride left/right and report whether it changed."""
+        if direction not in (-1, 1):
+            raise ValueError("goal frame direction must be -1 or +1")
+        next_index = int(
+            np.clip(
+                self.frame_index + direction * self.stride,
+                0,
+                self.frame_count - 1,
+            )
+        )
+        changed = next_index != self.frame_index
+        self.frame_index = next_index
+        return changed
+
+
+def select_goal_video_frame(video_path: Path) -> int | None:
+    """Show a small keyboard UI and return the confirmed zero-based frame.
+
+    This function is called before planner, camera, or robot initialization.
+    Returning ``None`` means the operator cancelled safely.
+    """
+    path = video_path.expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"goal video does not exist: {path}")
+    try:
+        import cv2
+        import pygame
+    except ImportError as exc:
+        raise RuntimeError(
+            "interactive goal selection requires OpenCV and pygame"
+        ) from exc
+
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        capture.release()
+        raise ValueError(f"failed to open goal video: {path}")
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    if frame_count < 1:
+        capture.release()
+        raise ValueError(f"goal video contains no seekable frames: {path}")
+    state = GoalFrameSelectorState(frame_count=frame_count)
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    if not np.isfinite(fps) or fps <= 0.0:
+        fps = 0.0
+
+    def read_frame() -> np.ndarray:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, state.frame_index)
+        ok, bgr = capture.read()
+        if not ok or bgr is None:
+            raise ValueError(
+                f"failed to decode frame {state.frame_index} from {path}"
+            )
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    pygame_initialized = False
+    try:
+        rgb = read_frame()
+        frame_height, frame_width = rgb.shape[:2]
+        scale = max(1, min(3, 900 // frame_width, 650 // frame_height))
+        display_size = (frame_width * scale, frame_height * scale)
+        status_height = 92
+
+        pygame.init()
+        pygame_initialized = True
+        screen = pygame.display.set_mode(
+            (display_size[0], display_size[1] + status_height)
+        )
+        pygame.display.set_caption("Select PushBox goal frame")
+        title_font = pygame.font.Font(None, 28)
+        help_font = pygame.font.Font(None, 22)
+        clock = pygame.time.Clock()
+
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return None
+                if event.type != pygame.KEYDOWN:
+                    continue
+                if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    return None
+                if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    return state.frame_index
+                if event.key in (pygame.K_1, pygame.K_KP1):
+                    state.set_stride(1)
+                elif event.key in (pygame.K_5, pygame.K_KP5):
+                    state.set_stride(5)
+                elif event.key == pygame.K_TAB:
+                    state.set_stride(5 if state.stride == 1 else 1)
+                elif event.key == pygame.K_LEFT and state.move(-1):
+                    rgb = read_frame()
+                elif event.key == pygame.K_RIGHT and state.move(1):
+                    rgb = read_frame()
+
+            frame_surface = pygame.image.frombuffer(
+                np.ascontiguousarray(rgb).tobytes(),
+                (frame_width, frame_height),
+                "RGB",
+            ).copy()
+            if scale != 1:
+                frame_surface = pygame.transform.scale(frame_surface, display_size)
+            screen.fill((18, 18, 18))
+            screen.blit(frame_surface, (0, 0))
+            time_text = (
+                f"  |  {state.frame_index / fps:.2f} s" if fps > 0.0 else ""
+            )
+            title = title_font.render(
+                f"Frame {state.frame_index} / {state.frame_count - 1}{time_text}"
+                f"  |  skip mode: {state.stride}",
+                True,
+                (245, 245, 245),
+            )
+            help_line = help_font.render(
+                "Left/Right: move   1 or 5: skip mode   Enter: select   Esc/Q: cancel",
+                True,
+                (195, 205, 215),
+            )
+            screen.blit(title, (12, display_size[1] + 14))
+            screen.blit(help_line, (12, display_size[1] + 51))
+            pygame.display.flip()
+            clock.tick(60)
+    except pygame.error as exc:
+        raise RuntimeError(f"failed to open goal-frame selector: {exc}") from exc
+    finally:
+        capture.release()
+        if pygame_initialized:
+            pygame.quit()
+
+
+def load_external_goal(
+    *,
+    goal_image: Path | None,
+    goal_video: Path | None,
+    goal_video_frame: int | None,
+    transform_profile: Any,
+) -> tuple[np.ndarray | None, dict[str, Any] | None]:
+    """Load an optional goal from an image or an indexed dataset-video frame."""
+    if goal_image is not None and goal_video is not None:
+        raise ValueError("--goal-image and --goal-video are mutually exclusive")
+    if goal_video is None and goal_video_frame is not None:
+        raise ValueError("--goal-video-frame requires --goal-video")
+    if goal_video is not None and goal_video_frame is None:
+        raise ValueError("--goal-video requires --goal-video-frame")
+    if goal_video_frame is not None and goal_video_frame < 0:
+        raise ValueError("--goal-video-frame must be non-negative")
+    source = goal_image if goal_image is not None else goal_video
+    if source is None:
+        return None, None
+    path = source.expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"goal source does not exist: {path}")
+    try:
+        frame = iio.imread(
+            path,
+            index=goal_video_frame if goal_video is not None else None,
+        )
+    except Exception as exc:
+        kind = "video frame" if goal_video is not None else "image"
+        raise ValueError(f"failed to read goal {kind} from {path}: {exc}") from exc
+    frame = np.asarray(frame)
+    if frame.ndim == 4 and goal_video is None and frame.shape[0] == 1:
+        frame = frame[0]
+    if frame.shape == MODEL_IMAGE_SHAPE and frame.dtype == np.uint8:
+        transformed = frame.copy()
+    elif frame.shape == (480, 640, 3) and frame.dtype == np.uint8:
+        transformed = np.asarray(transform_profile.apply(frame), dtype=np.uint8)
+    else:
+        raise ValueError(
+            "goal source must decode to RGB uint8 224x224 or raw RGB uint8 "
+            f"640x480, got {frame.shape} {frame.dtype}"
+        )
+    if transformed.shape != MODEL_IMAGE_SHAPE:
+        raise ValueError(
+            f"transformed goal must have shape {MODEL_IMAGE_SHAPE}, "
+            f"got {transformed.shape}"
+        )
+    metadata = {
+        "kind": "video_frame" if goal_video is not None else "image",
+        "path": str(path),
+        "frame_index": goal_video_frame,
+    }
+    return transformed, metadata
+
+
 class RunRecorder:
     """Small crash-readable run record: metadata, frames, and flushed JSONL events."""
 
@@ -211,7 +440,11 @@ class RunRecorder:
         stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
         self.path = root.expanduser().resolve() / f"{stamp}_{os.getpid()}"
         self.frames_path = self.path / "frames"
+        self.encoded_latents_path = self.path / "latents" / "z"
+        self.predicted_latents_path = self.path / "latents" / "z_hat"
         self.frames_path.mkdir(parents=True, exist_ok=False)
+        self.encoded_latents_path.mkdir(parents=True)
+        self.predicted_latents_path.mkdir(parents=True)
         (self.path / "metadata.json").write_text(
             json.dumps(_jsonable(metadata), indent=2, sort_keys=True) + "\n"
         )
@@ -234,6 +467,15 @@ class RunRecorder:
             np.asarray(image, dtype=np.uint8),
             compress_level=1,
         )
+        return str(relative)
+
+    def save_latent(self, name: str, latent: Any, *, predicted: bool) -> str:
+        array = np.asarray(latent, dtype=np.float32)
+        if array.ndim != 1 or array.size < 1 or not np.isfinite(array).all():
+            raise ValueError("latent must be a finite non-empty one-dimensional array")
+        category = "z_hat" if predicted else "z"
+        relative = Path("latents", category, f"{name}.npy")
+        np.save(self.path / relative, array, allow_pickle=False)
         return str(relative)
 
     def close(self) -> None:
@@ -517,6 +759,15 @@ class PlannerProcess:
             },
         )
 
+    def predict_next(self, action: np.ndarray) -> dict[str, Any]:
+        """Return z[t] and z_hat[t+1] for the exact accepted robot action."""
+        return self._round_trip(
+            {
+                "op": "predict_next",
+                "action": np.asarray(action, dtype=np.float32).copy(),
+            }
+        )
+
     def close(self) -> None:
         if self.process is not None and self.process.poll() is None:
             try:
@@ -552,6 +803,25 @@ def _build_parser(repo_root: Path) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--checkpoint", default="pushbox/lewm/weights_epoch_146.pt"
+    )
+    goal_source = parser.add_mutually_exclusive_group()
+    goal_source.add_argument(
+        "--goal-image",
+        type=Path,
+        help="use a 224x224 goal image instead of capturing one with g",
+    )
+    goal_source.add_argument(
+        "--goal-video",
+        type=Path,
+        help=(
+            "dataset video containing the goal; opens an interactive frame "
+            "selector unless --goal-video-frame is supplied"
+        ),
+    )
+    parser.add_argument(
+        "--goal-video-frame",
+        type=int,
+        help="zero-based frame within --goal-video; bypasses the selector",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--follower-ip", default="192.168.1.3")
@@ -783,6 +1053,35 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         else collector_repo / "config/camera-params.yaml"
     )
     args.dataset = args.dataset.expanduser().resolve()
+    if args.goal_image is not None:
+        args.goal_image = (
+            args.goal_image.expanduser()
+            if args.goal_image.is_absolute()
+            else repo_root / args.goal_image.expanduser()
+        ).resolve()
+    if args.goal_video is not None:
+        args.goal_video = (
+            args.goal_video.expanduser()
+            if args.goal_video.is_absolute()
+            else repo_root / args.goal_video.expanduser()
+        ).resolve()
+    if args.goal_video is not None and args.goal_video_frame is None:
+        if args.preflight:
+            parser.error(
+                "--preflight with --goal-video requires --goal-video-frame "
+                "because preflight never opens a display"
+            )
+        try:
+            selected_frame = select_goal_video_frame(args.goal_video)
+        except (ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        if selected_frame is None:
+            print(
+                "Goal selection cancelled; planner, camera, and robot were not started."
+            )
+            return 0
+        args.goal_video_frame = selected_frame
+        print(f"Selected goal video frame {selected_frame}.")
     sys.path.insert(0, str(collector_repo))
 
     from scripts.collect_keyboard_xy import (
@@ -850,6 +1149,30 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         args.transform_profile,
         args.camera_params,
     )
+    latent_dim = int(
+        artifact_manifest["runtime"]["latent_dim"]
+        if artifact_manifest is not None
+        else 192
+    )
+    try:
+        external_goal, external_goal_source = load_external_goal(
+            goal_image=args.goal_image,
+            goal_video=args.goal_video,
+            goal_video_frame=args.goal_video_frame,
+            transform_profile=config.transform_profile,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if external_goal_source is not None:
+        print(
+            "Loaded external goal: "
+            f"{external_goal_source['path']}"
+            + (
+                f" frame {external_goal_source['frame_index']}"
+                if external_goal_source["frame_index"] is not None
+                else ""
+            )
+        )
 
     mode_name = "EXECUTE" if args.execute else "DRY RUN"
     print(f"Starting real PushBox evaluation in {mode_name} mode")
@@ -900,6 +1223,16 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 "collector_repo": collector_repo,
                 "transform_profile_sha256": _sha256(args.transform_profile),
                 "camera_params_sha256": _sha256(args.camera_params),
+                "external_goal_source": external_goal_source,
+                "latent_artifacts": {
+                    "z": "projected encoder latent of observation[t]",
+                    "z_hat": (
+                        "one-step predictor latent for observation[t+1], "
+                        "conditioned on the accepted robot action[t]"
+                    ),
+                    "dtype": "float32",
+                    "alignment": "z[t] + action[t] -> z_hat[t+1]",
+                },
             },
         )
         print(f"Run record: {recorder.path}")
@@ -961,7 +1294,9 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         preview = np.zeros(MODEL_IMAGE_SHAPE, dtype=np.uint8)
         preview_sequence: int | None = None
         plan_sequence: int | None = None
-        goal: np.ndarray | None = None
+        goal: np.ndarray | None = (
+            None if external_goal is None else external_goal.copy()
+        )
         autonomous = False
         preview_once = False
         resetting = False
@@ -969,10 +1304,10 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         pending: Future | None = None
         pending_generation = -1
         generation = 0
-        reset_planner = False
+        reset_planner = external_goal is not None
         action_count = 0
-        trial_id = 0
-        trial_complete = True
+        trial_id = 1 if external_goal is not None else 0
+        trial_complete = external_goal is None
         latest_action = np.zeros(2, dtype=np.float32)
         latest_plan = np.zeros((args.horizon, 2), dtype=np.float32)
         latest_cost: float | None = None
@@ -994,6 +1329,20 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         pending_current: np.ndarray | None = None
         pending_command_to_capture_s: float | None = None
         pending_settle_to_capture_s: float | None = None
+
+        if goal is not None:
+            goal_path = recorder.save_frame(f"trial_{trial_id:03d}_goal", goal)
+            recorder.event(
+                "trial_started",
+                trial_id=trial_id,
+                goal_frame=goal_path,
+                goal_source=external_goal_source,
+                camera_sequence=None,
+            )
+            print(
+                "external goal ready. Arrange the current scene, then press v "
+                "for a preview or p to arm autonomous execution."
+            )
 
         def mark_motion_pending(command_ns: int | None = None) -> None:
             nonlocal tracking_check_after, motion_settle_deadline
@@ -1276,12 +1625,47 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                             else:
                                 measured_before = None
                                 executed = np.zeros(2, dtype=np.float32)
+                                encoded_latent = None
+                                predicted_next_latent = None
+                                latent_prediction_s = None
                                 command_ns = time.monotonic_ns()
                                 if args.execute and arm is not None:
                                     try:
                                         measured_before = read_pose(require_tracking=True)
                                     except (RuntimeError, ValueError) as exc:
                                         latch_fault(f"pose verification failed: {exc}")
+                                    if not faulted:
+                                        try:
+                                            latent_prediction_started = time.monotonic()
+                                            transition = planner.predict_next(accepted)
+                                            latent_prediction_s = (
+                                                time.monotonic()
+                                                - latent_prediction_started
+                                            )
+                                            (
+                                                encoded_latent,
+                                                predicted_next_latent,
+                                            ) = validate_transition_prediction(
+                                                transition,
+                                                action=accepted,
+                                                latent_dim=latent_dim,
+                                            )
+                                        except (KeyError, RuntimeError, ValueError) as exc:
+                                            latch_fault(
+                                                "latent transition prediction failed: "
+                                                f"{exc}"
+                                            )
+                                    if not faulted:
+                                        plan_age_s = (
+                                            time.monotonic_ns()
+                                            - pending_frame_receipt_ns
+                                        ) / 1e9
+                                        if plan_age_s > args.max_plan_age:
+                                            latch_fault(
+                                                "plan age after latent prediction "
+                                                f"{plan_age_s:.3f}s exceeds "
+                                                f"{args.max_plan_age:.3f}s"
+                                            )
                                     if not faulted:
                                         arm.send_cartesian(
                                             np.r_[target, config.fixed_z, FIXED_ORIENTATION]
@@ -1304,11 +1688,39 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                         f"trial_{trial_id:03d}_step_{action_count:03d}",
                                         pending_current,
                                     )
+                                    encoded_latent_path = None
+                                    predicted_latent_path = None
+                                    if (
+                                        encoded_latent is not None
+                                        and predicted_next_latent is not None
+                                    ):
+                                        latent_name = (
+                                            f"trial_{trial_id:03d}_step_"
+                                            f"{action_count:03d}"
+                                        )
+                                        encoded_latent_path = recorder.save_latent(
+                                            latent_name,
+                                            encoded_latent,
+                                            predicted=False,
+                                        )
+                                        predicted_latent_path = recorder.save_latent(
+                                            latent_name,
+                                            predicted_next_latent,
+                                            predicted=True,
+                                        )
                                     recorder.event(
                                         "autonomous_step",
                                         trial_id=trial_id,
                                         step=action_count,
                                         observation_frame=frame_path,
+                                        encoded_latent=encoded_latent_path,
+                                        predicted_next_latent=predicted_latent_path,
+                                        prediction_action=(
+                                            accepted
+                                            if predicted_latent_path is not None
+                                            else None
+                                        ),
+                                        latent_prediction_s=latent_prediction_s,
                                         camera_sequence=pending_frame_sequence,
                                         plan_age_s=plan_age_s,
                                         command_to_capture_s=pending_command_to_capture_s,

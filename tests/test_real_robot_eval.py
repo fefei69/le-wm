@@ -10,10 +10,12 @@ import unittest
 from real_robot_eval import (
     ACTION_CAP_M,
     DEFAULT_SETTLED_LINEAR_SPEED_M_S,
+    GoalFrameSelectorState,
     PlannerProcess,
     RunRecorder,
     UIEvents,
     _workspace_bounds,
+    load_external_goal,
     motion_completion_status,
     prioritize_ui_events,
     snapshot_follows_settle,
@@ -21,6 +23,7 @@ from real_robot_eval import (
     validate_measured_pose,
     validate_planned_action,
     validate_planner_result,
+    validate_transition_prediction,
 )
 from real_robot_planner import (
     CEMConfig,
@@ -31,6 +34,29 @@ from real_robot_planner import (
 
 
 class RealRobotSafetyTests(unittest.TestCase):
+    def test_goal_frame_selector_navigation_uses_one_or_five_frame_stride(self):
+        state = GoalFrameSelectorState(frame_count=12)
+        self.assertEqual(state.frame_index, 0)
+        self.assertFalse(state.move(-1))
+        self.assertTrue(state.move(1))
+        self.assertEqual(state.frame_index, 1)
+
+        state.set_stride(5)
+        self.assertTrue(state.move(1))
+        self.assertEqual(state.frame_index, 6)
+        self.assertTrue(state.move(1))
+        self.assertEqual(state.frame_index, 11)
+        self.assertFalse(state.move(1))
+        self.assertTrue(state.move(-1))
+        self.assertEqual(state.frame_index, 6)
+
+        with self.assertRaisesRegex(ValueError, "stride"):
+            state.set_stride(2)
+        with self.assertRaisesRegex(ValueError, "direction"):
+            state.move(0)
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            GoalFrameSelectorState(frame_count=0)
+
     def test_validate_planned_action_accepts_bounded_xy_delta(self):
         action = validate_planned_action([0.006, 0.008])
         np.testing.assert_allclose(action, [0.006, 0.008])
@@ -167,6 +193,62 @@ class RealRobotSafetyTests(unittest.TestCase):
                 invalid_plan, cap_m=ACTION_CAP_M, horizon=3
             )
 
+    def test_validate_transition_prediction_checks_action_and_latent_shape(self):
+        result = {
+            "prediction_action": np.array([0.0025, 0.0], dtype=np.float32),
+            "encoded_latent": np.arange(4, dtype=np.float32),
+            "predicted_next_latent": np.arange(4, dtype=np.float32) + 1,
+        }
+        encoded, predicted = validate_transition_prediction(
+            result, action=[0.0025, 0.0], latent_dim=4
+        )
+        np.testing.assert_array_equal(encoded, np.arange(4, dtype=np.float32))
+        np.testing.assert_array_equal(
+            predicted, np.arange(4, dtype=np.float32) + 1
+        )
+        with self.assertRaisesRegex(ValueError, "different action"):
+            validate_transition_prediction(
+                result, action=[-0.0025, 0.0], latent_dim=4
+            )
+        with self.assertRaisesRegex(ValueError, "shape"):
+            validate_transition_prediction(
+                result, action=[0.0025, 0.0], latent_dim=3
+            )
+
+    def test_external_goal_loads_image_and_validates_video_arguments(self):
+        class UnexpectedTransform:
+            def apply(self, frame):
+                raise AssertionError("224x224 goal should not be transformed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "goal.png")
+            expected = np.full((224, 224, 3), 73, dtype=np.uint8)
+            iio.imwrite(path, expected)
+            goal, source = load_external_goal(
+                goal_image=path,
+                goal_video=None,
+                goal_video_frame=None,
+                transform_profile=UnexpectedTransform(),
+            )
+            np.testing.assert_array_equal(goal, expected)
+            self.assertEqual(source["kind"], "image")
+            self.assertEqual(source["path"], str(path.resolve()))
+
+        with self.assertRaisesRegex(ValueError, "requires --goal-video"):
+            load_external_goal(
+                goal_image=None,
+                goal_video=None,
+                goal_video_frame=3,
+                transform_profile=UnexpectedTransform(),
+            )
+        with self.assertRaisesRegex(ValueError, "requires --goal-video-frame"):
+            load_external_goal(
+                goal_image=None,
+                goal_video=Path("episode.mp4"),
+                goal_video_frame=None,
+                transform_profile=UnexpectedTransform(),
+            )
+
     def test_validate_measured_pose_checks_tracking_and_workspace(self):
         pose = np.array([0.14, 0.02, 0.03, 0.0, np.pi / 2, 0.0])
         measured = validate_measured_pose(
@@ -268,6 +350,12 @@ class RealRobotSafetyTests(unittest.TestCase):
                 dtype=np.uint8,
             )
             frame = recorder.save_frame("goal", expected)
+            latent = recorder.save_latent(
+                "trial_001_step_001", [1.0, 2.0, 3.0], predicted=False
+            )
+            predicted = recorder.save_latent(
+                "trial_001_step_001", [1.5, 2.5, 3.5], predicted=True
+            )
             recorder.event("trial_started", frame=frame)
             run_path = recorder.path
             recorder.close()
@@ -279,6 +367,13 @@ class RealRobotSafetyTests(unittest.TestCase):
             self.assertEqual(Path(frame).suffix, ".png")
             self.assertTrue((run_path / frame).is_file())
             np.testing.assert_array_equal(iio.imread(run_path / frame), expected)
+            np.testing.assert_array_equal(
+                np.load(run_path / latent), np.array([1.0, 2.0, 3.0], np.float32)
+            )
+            np.testing.assert_array_equal(
+                np.load(run_path / predicted),
+                np.array([1.5, 2.5, 3.5], np.float32),
+            )
 
     def test_planner_round_trip_has_a_response_deadline(self):
         class NoResponseConnection:

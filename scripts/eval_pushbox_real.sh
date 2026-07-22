@@ -17,10 +17,16 @@ robot_args=(
     --x-max 0.45
     --y-min -0.26
     --y-max 0.26
-    --trajectory-check-samples 10
-    --camera-check-seconds 5
-    --settled-linear-speed 0.1
-    --action-mode keyboard
+    --trajectory-check-samples 10 
+    --camera-check-seconds 5 
+    --settled-linear-speed 0.1 
+    --action-mode keyboard 
+    --horizon 10 
+    --action-cap 0.005 
+    --num-samples 1024 
+    --iterations 10 
+    --elite-count 32 
+    --max-actions 100
 )
 
 # This launcher defaults to live execution. --dry-run is handled here rather
