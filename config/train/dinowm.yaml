@@ -1,0 +1,102 @@
+defaults:
+  - launcher: local
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+
+output_model_name: pushbox/dinowm_dinov2s_prop_4h
+subdir: pushbox-dinowm-dinov2s-prop-4h
+dry_run: false
+seed: 3072
+
+# PushBox was recorded at 5 Hz. The nominal 4 h curve consumes every training
+# episode remaining after the common held-out validation split (~3.7 h actual).
+curve:
+  label: 4h
+  train_hours: 4.0
+  sample_hz: 5.0
+  subset_seed: 8317
+
+dataset_name: ${oc.env:PUSHBOX_DATASET,pushbox_pilot_train.h5}
+n_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+frameskip: 1
+train_split: 0.9
+split_search_trials: 50000
+
+image_size: 224
+patch_size: 14
+batch_size: 32
+num_workers: 16
+prefetch_factor: 3
+
+wm:
+  history_size: 3
+  num_preds: 1
+  encoding:
+    proprio: 10
+    action: 10
+
+# This is the published DINO-WM "small predictor" shape: DINOv2-small patch
+# tokens plus a depth-6 causal transformer with 16 heads and a 2048-wide MLP.
+predictor:
+  size: small
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+model:
+  _target_: stable_worldmodel.wm.PreJEPA
+  history_size: ${wm.history_size}
+  num_pred: ${wm.num_preds}
+  interpolate_pos_encoding: true
+  encoder:
+    _target_: stable_worldmodel.wm.prejepa.module.create_backbone
+    name: dinov2_small
+  predictor:
+    _target_: stable_worldmodel.wm.prejepa.module.CausalPredictor
+    num_patches: ???
+    num_frames: ${wm.history_size}
+    dim: ???
+    depth: ${predictor.depth}
+    heads: ${predictor.heads}
+    mlp_dim: ${predictor.mlp_dim}
+    dim_head: ${predictor.dim_head}
+    dropout: ${predictor.dropout}
+    emb_dropout: ${predictor.emb_dropout}
+
+optimizer:
+  type: AdamW
+  lr: 5e-4
+  weight_decay: 0.0
+
+checkpoint_interval: 5
+trainer:
+  max_epochs: 10
+  devices: 1
+  accelerator: gpu
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 20
+
+wandb:
+  # Keep experiment data local unless W&B is explicitly enabled by the user.
+  enabled: false
+  config:
+    entity: cw5167-nyu
+    project: le-wm
+    name: pushbox-dinowm-dinov2s-prop-${curve.label}
+    id: ${subdir}
+    group: pushbox-dinowm-learning-curves
+    tags:
+      - pushbox
+      - dinowm
+      - dinov2-small
+      - proprio
+      - ${curve.label}
+    resume: allow
+    log_model: false

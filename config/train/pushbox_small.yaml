@@ -1,0 +1,61 @@
+# PushBox LeWM training with the larger ViT-small encoder (embed_dim 384).
+#
+# Same data/optimization as config/train/pushbox.yaml, but selects the
+# model/lewm_small backbone and lifts the latent width 192 -> 384. Checkpoints
+# go to a separate output_model_name so the existing ViT-tiny run
+# (pushbox/lewm/weights_epoch_*.pt) is left untouched and stays comparable.
+#
+# Run:
+#   python train.py --config-name=pushbox_small subdir="pushbox-lewm-small-<id>"
+
+defaults:
+  - launcher: local
+  - data: pushbox
+  - model: lewm_small
+  - _self_
+
+output_model_name: pushbox/lewm_small
+subdir: pushbox-lewm-small
+checkpoint_interval: 1
+
+num_workers: 6
+train_split: 0.9
+seed: 3072
+img_size: 224
+embed_dim: 384          # must match encoder hidden_size for size=small
+history_size: 3
+
+trainer:
+  # There are 66,468 training clips after the deterministic episode-level
+  # split. At batch size 128, 150 epochs gives about 78k optimizer steps.
+  max_epochs: 150
+  devices: auto
+  accelerator: gpu
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 128
+  num_workers: ${num_workers}
+  persistent_workers: true
+  prefetch_factor: 3
+  pin_memory: true
+  multiprocessing_context: spawn
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+num_preds: 1
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
+
+# The local launcher defines the W&B destination.
+wandb:
+  enabled: true

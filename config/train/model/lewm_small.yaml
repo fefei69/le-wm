@@ -1,0 +1,54 @@
+# ViT-small variant of the LeWM world model (encoder hidden_size 384).
+#
+# Identical to model/lewm.yaml except the encoder size. Everything downstream
+# keys off ${embed_dim}, so set embed_dim: 384 in the train config that selects
+# this model (see config/train/pushbox_small.yaml). The predictor input/output
+# and AdaLN layers scale with embed_dim, while its depth, attention inner width,
+# and MLP width remain explicit knobs. Predictor-depth sweeps can therefore
+# override model.predictor.depth without changing the latent interface.
+
+_target_: jepa.JEPA
+
+encoder:
+  _target_: stable_pretraining.backbone.utils.vit_hf
+  size: small            # 384-d, 12 layers, 6 heads (was: tiny / 192-d)
+  patch_size: 14
+  image_size: ${img_size}
+  pretrained: false
+  use_mask_token: false
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${history_size}
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+projector:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
