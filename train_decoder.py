@@ -4,11 +4,20 @@ Post-hoc pixel probe, as in the LeWM paper (App. D, Fig. 7/10): the world model
 is frozen, the decoder regresses ImageNet-normalized pixels from the 192-d
 per-frame latent with plain MSE. No gradients ever reach the encoder.
 
+Validation is episode-atomic. A frame-level split leaks: consecutive frames of a
+trajectory are near-duplicates, so a held-out frame almost always has a
+neighbouring frame in the training set and validation scores an interpolation
+rather than generalization. By default the split is recomputed with the same
+balanced-episode search, seed and train fraction the world model itself used, so
+the decoder is scored on the world model's own held-out episodes; --manifest
+pins an explicit episode list when a checkpoint ships one.
+
 Usage:
     python train_decoder.py --checkpoint lewm/weights_epoch_10.pt --dataset pusht_expert_train
 """
 
 import argparse
+import json
 import math
 from pathlib import Path
 
@@ -19,7 +28,7 @@ import stable_worldmodel as swm
 import wandb
 from torchvision.utils import save_image
 
-from utils import get_img_preprocessor
+from utils import balanced_episode_split, get_img_preprocessor
 from image_decoder import CLSDecoder
 
 
@@ -48,17 +57,31 @@ def parse_args():
     p.add_argument("--depth", type=int, default=3)
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=6)
-    p.add_argument("--val-batches", type=positive_int, default=8,
+    p.add_argument("--val-batches", type=positive_int, default=32,
                    help="val batches per eval pass")
+    p.add_argument("--manifest", default=None,
+                   help="split_manifest.json holding validation_episode_indices; "
+                        "overrides the recomputed episode split")
+    p.add_argument("--split-fraction", type=float, default=0.9,
+                   help="train fraction for the episode split (match the WM's train_split)")
+    p.add_argument("--split-num-steps", type=positive_int, default=4,
+                   help="WM window length (history_size + num_preds); the episode "
+                        "search balances clip counts, so this must match WM training "
+                        "for the split to reproduce")
+    p.add_argument("--split-search-trials", type=positive_int, default=50_000)
     p.add_argument("--viz-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--seed", type=int, default=3072)
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", default=None,
                    help="output dir (default: $STABLEWM_HOME/checkpoints/<ckpt_dir>/decoder)")
+    p.add_argument("--no-resume", action="store_true",
+                   help="ignore an existing decoder.pt instead of continuing it")
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-entity", default="cw5167-nyu")
     p.add_argument("--wandb-project", default="le-wm")
+    p.add_argument("--wandb-name", default=None,
+                   help="optional explicit W&B run name")
     return p.parse_args()
 
 
@@ -78,6 +101,42 @@ def denormalize(img):
     return (img * std + mean).clamp(0, 1)
 
 
+def indices_for_episodes(dataset, episode_indices):
+    selected = {int(index) for index in episode_indices}
+    return [
+        index
+        for index, (episode, _) in enumerate(dataset.clip_indices)
+        if int(episode) in selected
+    ]
+
+
+def validation_episodes(args):
+    """Episodes held out from decoder training, as a set of episode indices."""
+    if args.manifest:
+        with Path(args.manifest).expanduser().open() as handle:
+            manifest = json.load(handle)
+        if "validation_episode_indices" not in manifest:
+            raise ValueError(f"{args.manifest} has no validation_episode_indices")
+        return {int(index) for index in manifest["validation_episode_indices"]}
+
+    # The balanced search scores candidate splits by usable-clip imbalance, so it
+    # only reproduces the world model's partition when the dataset is windowed the
+    # same way. Build a WM-shaped view purely to derive the episode assignment.
+    wm_view = swm.data.HDF5Dataset(
+        args.dataset,
+        frameskip=1,
+        num_steps=args.split_num_steps,
+        keys_to_load=["pixels"],
+    )
+    split = balanced_episode_split(
+        wm_view,
+        train_fraction=args.split_fraction,
+        seed=args.seed,
+        search_trials=args.split_search_trials,
+    )
+    return {int(index) for index in split.val_episode_indices}
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -95,17 +154,30 @@ def main():
         source="pixels", target="pixels", img_size=args.img_size
     )
 
+    val_episodes = validation_episodes(args)
+    val_indices = indices_for_episodes(dataset, val_episodes)
+    train_indices = [
+        index
+        for index, (episode, _) in enumerate(dataset.clip_indices)
+        if int(episode) not in val_episodes
+    ]
+    if len(train_indices) < args.batch_size or not val_indices:
+        raise ValueError(
+            f"invalid split sizes: train={len(train_indices)}, val={len(val_indices)}"
+        )
+    print(f"episode split: {len(train_indices):,} train frames, "
+          f"{len(val_indices):,} val frames over {len(val_episodes)} held-out episodes")
+
     gen = torch.Generator().manual_seed(args.seed)
-    train_set, val_set = torch.utils.data.random_split(
-        dataset, [0.99, 0.01], generator=gen
-    )
     train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=True, drop_last=True,
+        torch.utils.data.Subset(dataset, train_indices),
+        batch_size=args.batch_size, shuffle=True, drop_last=True,
         num_workers=args.num_workers, persistent_workers=args.num_workers > 0,
         pin_memory=True, generator=gen,
     )
     val_loader = torch.utils.data.DataLoader(
-        val_set, batch_size=args.batch_size, shuffle=False, num_workers=2
+        torch.utils.data.Subset(dataset, val_indices),
+        batch_size=args.batch_size, shuffle=False, num_workers=2
     )
     viz_batch = next(iter(val_loader))["pixels"].squeeze(1)[:8].to(device)
 
@@ -129,14 +201,37 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"outputs -> {out_dir}")
 
+    latest_path = out_dir / "decoder.pt"
+    best_path = out_dir / "decoder_best.pt"
+    step, ema, best_val_mse = 0, None, math.inf
+    if latest_path.is_file() and not args.no_resume:
+        saved = torch.load(latest_path, map_location=device, weights_only=False)
+        decoder.load_state_dict(saved["state_dict"])
+        if "optimizer" in saved:
+            opt.load_state_dict(saved["optimizer"])
+        if "scheduler" in saved:
+            sched.load_state_dict(saved["scheduler"])
+        step = int(saved.get("step", 0))
+        ema = saved.get("ema")
+        best_val_mse = float(saved.get("best_val_mse", math.inf))
+        print(f"resumed decoder at step {step:,} from {latest_path}")
+
+    run_name = args.wandb_name or (
+        f"decoder-{args.latent}-{Path(args.checkpoint).stem}-p{args.patch_size}"
+    )
     run = None
     if not args.no_wandb:
+        # Keying the run on its name lets a requeued job continue the same curves
+        # instead of starting a second, truncated run.
         run = wandb.init(
             entity=args.wandb_entity, project=args.wandb_project,
-            name=f"decoder-{args.latent}-{Path(args.checkpoint).stem}",
+            name=run_name, id=run_name, resume="allow",
             job_type="decoder-probe",
             config={**vars(args), "z_dim": z_dim,
-                    "decoder_params": sum(p.numel() for p in decoder.parameters())},
+                    "decoder_params": sum(p.numel() for p in decoder.parameters()),
+                    "train_frames": len(train_indices),
+                    "val_frames": len(val_indices),
+                    "val_episodes": sorted(val_episodes)},
         )
 
     def save_viz(step):
@@ -152,20 +247,24 @@ def main():
     @torch.no_grad()
     def evaluate():
         decoder.eval()
-        mse, mse01, n = 0.0, 0.0, 0
+        # Sum-reduce over elements rather than averaging per-batch means: the last
+        # val batch is short, and a batch-count average would silently overweight it.
+        normalized_sse, pixel_sse, count = 0.0, 0.0, 0
         for i, batch in enumerate(val_loader):
             if i == args.val_batches:
                 break
             px = batch["pixels"].squeeze(1).to(device)
             recon = decoder(encode(model, px, args.latent))
-            mse += F.mse_loss(recon, px).item() * px.size(0)
-            mse01 += F.mse_loss(denormalize(recon), denormalize(px)).item() * px.size(0)
-            n += px.size(0)
+            normalized_sse += F.mse_loss(recon, px, reduction="sum").item()
+            pixel_sse += F.mse_loss(
+                denormalize(recon), denormalize(px), reduction="sum"
+            ).item()
+            count += px.numel()
         decoder.train()
-        return mse / n, -10 * math.log10(mse01 / n)
+        return normalized_sse / count, -10 * math.log10(max(pixel_sse / count, 1e-12))
 
-    step, ema = 0, None
-    save_viz(0)
+    if step == 0:
+        save_viz(0)
     while step < args.steps:
         for batch in train_loader:
             pixels = batch["pixels"].squeeze(1).to(device, non_blocking=True)
@@ -191,19 +290,33 @@ def main():
             if step % args.viz_every == 0 or step == args.steps:
                 grid_path = save_viz(step)
                 val_mse, val_psnr = evaluate()
+                is_best = val_mse < best_val_mse
+                best_val_mse = min(best_val_mse, val_mse)
                 print(f"step {step:6d}/{args.steps}  val mse {val_mse:.4f}  "
                       f"psnr {val_psnr:.1f} dB", flush=True)
                 if run:
                     run.log({"val/mse": val_mse, "val/psnr_db": val_psnr,
+                             "val/best_mse": best_val_mse,
                              "viz/recon": wandb.Image(str(grid_path))}, step=step)
+                payload = {
+                    "state_dict": decoder.state_dict(), "args": vars(args),
+                    "step": step, "val_mse": val_mse, "val_psnr_db": val_psnr,
+                    "z_dim": z_dim, "latent_type": args.latent,
+                    "source_checkpoint": args.checkpoint,
+                }
                 torch.save(
-                    {"state_dict": decoder.state_dict(), "args": vars(args), "step": step},
-                    out_dir / "decoder.pt",
+                    {**payload, "optimizer": opt.state_dict(),
+                     "scheduler": sched.state_dict(), "ema": ema,
+                     "best_val_mse": best_val_mse},
+                    latest_path,
                 )
+                if is_best:
+                    torch.save(payload, best_path)
             if step >= args.steps:
                 break
 
     if run:
+        run.summary.update({"val/best_mse": best_val_mse})
         run.finish()
     print(f"done. weights + recon grids in {out_dir}")
 
