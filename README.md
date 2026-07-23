@@ -196,6 +196,9 @@ zero/8-way actions used by the collector at the enabled 2.5, 5, and 10 mm
 magnitudes. The selected `--action-cap` removes larger magnitudes; for example,
 `--action-cap 0.005` searches 17 actions (zero plus eight directions at 2.5 and
 5 mm). Use `--action-mode continuous` only for an explicit A/B comparison.
+The default `--solver cem` samples Gaussian XY proposals before this
+quantization. Use `--solver categorical-cem` to sample the 17 exact tokens
+directly and save the final per-horizon token probabilities in `events.jsonl`.
 The default checkpoint, dataset, normalization, camera parameters, and image
 transform are checked against
 `config/real_robot_eval.json`; `--allow-artifact-mismatch` is an explicit

@@ -26,6 +26,7 @@ robot_args=(
 # these values, so an explicit override such as --action-mode continuous or
 # --iterations 30 wins.
 planner_args=(
+    --solver cem
     --action-mode keyboard
     --horizon 5
     --action-cap 0.005
@@ -46,11 +47,12 @@ Wrapper options:
   -h, --help              Show this help
 
 Planner defaults:
-  LeWM CEM, keyboard actions, horizon 5, 1024 samples x 20 iterations,
+  LeWM Gaussian CEM, keyboard actions, horizon 5, 1024 samples x 20 iterations,
   128 elites, 5 mm action cap, and 50 maximum actions.
 
 Other options are forwarded to real_robot_eval.py after these defaults, so
-explicit expert overrides such as --action-mode or --iterations still win.
+explicit expert overrides such as --solver categorical-cem or --iterations
+still win.
 EOF
 }
 

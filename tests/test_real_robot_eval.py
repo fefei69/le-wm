@@ -27,13 +27,17 @@ from real_robot_eval import (
     validate_measured_pose,
     validate_planned_action,
     validate_planner_result,
+    validate_solver_diagnostics,
     validate_transition_prediction,
 )
 from real_robot_planner import (
     CEMConfig,
+    PushBoxPlanner,
+    categorical_elite_update,
     clamp_action_norm,
     keyboard_action_vocabulary,
     quantize_actions,
+    sample_categorical_indices,
 )
 
 
@@ -110,6 +114,101 @@ class RealRobotSafetyTests(unittest.TestCase):
             CEMConfig(goal_tolerance=np.nan).validate()
         with self.assertRaisesRegex(ValueError, "action_mode"):
             CEMConfig(action_mode="unknown").validate()
+        with self.assertRaisesRegex(ValueError, "solver"):
+            CEMConfig(solver="unknown").validate()
+        with self.assertRaisesRegex(ValueError, "requires"):
+            CEMConfig(
+                solver="categorical-cem", action_mode="continuous"
+            ).validate()
+
+    def test_categorical_elites_preserve_opposing_modes_and_probability_floor(self):
+        probabilities = torch.full((2, 3), 1.0 / 3.0)
+        elite_indices = torch.tensor(
+            [[1, 1], [2, 2], [1, 2], [2, 1]], dtype=torch.int64
+        )
+        updated = categorical_elite_update(
+            probabilities,
+            elite_indices,
+            alpha=1.0,
+            min_prob=0.05,
+        )
+        expected = torch.tensor(
+            [[0.05, 0.475, 0.475], [0.05, 0.475, 0.475]]
+        )
+        torch.testing.assert_close(updated, expected)
+        torch.testing.assert_close(updated.sum(dim=1), torch.ones(2))
+
+    def test_categorical_sampling_and_search_use_exact_vocabulary_tokens(self):
+        deterministic = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float32
+        )
+        sampled = sample_categorical_indices(
+            deterministic,
+            num_samples=8,
+            generator=torch.Generator().manual_seed(7),
+        )
+        self.assertEqual(sampled.shape, (8, 2))
+        torch.testing.assert_close(sampled[:, 0], torch.ones(8, dtype=torch.int64))
+        torch.testing.assert_close(sampled[:, 1], torch.zeros(8, dtype=torch.int64))
+
+        planner = object.__new__(PushBoxPlanner)
+        planner.config = CEMConfig(
+            horizon=2,
+            num_samples=64,
+            iterations=4,
+            elite_count=8,
+            action_cap_m=0.005,
+            action_mode="keyboard",
+            solver="categorical-cem",
+            categorical_alpha=0.8,
+            categorical_min_prob=0.01,
+            seed=11,
+        )
+        planner.device = torch.device("cpu")
+        planner.generator = torch.Generator().manual_seed(11)
+        planner.action_vocabulary = torch.from_numpy(
+            keyboard_action_vocabulary(0.005)
+        )
+        planner._previous_action_probabilities = None
+        planner._rollout_cost = (
+            lambda latent, goal, actions: actions.square().sum(dim=(1, 2))
+        )
+        plan, cost, final_probabilities = planner._categorical_cem_search(
+            torch.zeros(1, 1, 1), torch.zeros(1, 1, 1)
+        )
+        torch.testing.assert_close(plan, torch.zeros_like(plan))
+        self.assertEqual(cost, 0.0)
+        self.assertEqual(final_probabilities.shape, (2, 17))
+        self.assertTrue(torch.all(final_probabilities >= 0.01))
+        for action in plan:
+            self.assertTrue(
+                torch.any(
+                    torch.all(planner.action_vocabulary == action, dim=1)
+                )
+            )
+
+        previous = torch.zeros_like(final_probabilities)
+        previous[0, 3] = 1.0
+        previous[1, 4] = 1.0
+        planner._previous_action_probabilities = previous
+        captured_candidates = []
+
+        def capture_cost(latent, goal, actions):
+            captured_candidates.append(actions.detach().clone())
+            return actions.square().sum(dim=(1, 2))
+
+        planner._rollout_cost = capture_cost
+        planner._categorical_cem_search(
+            torch.zeros(1, 1, 1), torch.zeros(1, 1, 1)
+        )
+        # The old step 1 distribution shifts to new step 0; the new terminal
+        # distribution is uniform, whose deterministic mode is token zero.
+        torch.testing.assert_close(
+            captured_candidates[0][0, 0], planner.action_vocabulary[4]
+        )
+        torch.testing.assert_close(
+            captured_candidates[0][0, 1], planner.action_vocabulary[0]
+        )
 
     def test_keyboard_vocabulary_matches_collector_actions_under_cap(self):
         vocabulary = keyboard_action_vocabulary(0.005)
@@ -195,6 +294,41 @@ class RealRobotSafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_planner_result(
                 invalid_plan, cap_m=ACTION_CAP_M, horizon=3
+            )
+
+    def test_validates_categorical_solver_diagnostics(self):
+        vocabulary = keyboard_action_vocabulary(0.005)
+        plan = vocabulary[[1, 2, 0]]
+        probabilities = np.full((3, len(vocabulary)), 1.0 / len(vocabulary))
+        validated_probabilities, validated_vocabulary = validate_solver_diagnostics(
+            {
+                "solver": "categorical-cem",
+                "action_probabilities": probabilities,
+                "action_vocabulary": vocabulary,
+            },
+            expected_solver="categorical-cem",
+            plan=plan,
+            horizon=3,
+            cap_m=0.005,
+            at_goal=False,
+        )
+        np.testing.assert_allclose(validated_probabilities, probabilities)
+        np.testing.assert_allclose(validated_vocabulary, vocabulary)
+
+        invalid = probabilities.copy()
+        invalid[0] *= 0.5
+        with self.assertRaisesRegex(ValueError, "normalized"):
+            validate_solver_diagnostics(
+                {
+                    "solver": "categorical-cem",
+                    "action_probabilities": invalid,
+                    "action_vocabulary": vocabulary,
+                },
+                expected_solver="categorical-cem",
+                plan=plan,
+                horizon=3,
+                cap_m=0.005,
+                at_goal=False,
             )
 
     def test_validate_transition_prediction_checks_action_and_latent_shape(self):

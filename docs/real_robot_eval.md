@@ -58,7 +58,7 @@ The settled-speed value is an observation gate, not the commanded robot speed.
 The controller also waits for the nominal trajectory duration and verifies the
 target pose before accepting a post-motion image.
 
-### CEM planner
+### CEM planners
 
 The real planner:
 
@@ -78,6 +78,28 @@ eight normalized arrow-key directions at each enabled magnitude. With
 `--action-cap 0.005`, this produces 17 exact actions: zero and eight directions
 at both 2.5 and 5 mm. `--action-mode continuous` remains available for an
 explicit comparison.
+
+The default `--solver cem` retains Gaussian CEM: it samples continuous XY
+vectors and then constrains them to the keyboard vocabulary. The additional
+`--solver categorical-cem` maintains one probability vector over the exact
+keyboard tokens for each horizon step and samples token indices directly:
+
+```bash
+scripts/eval_pushbox_real.sh --solver categorical-cem
+```
+
+Both variants use the same horizon, sample/iteration/elite counts, latent
+rollout, objective, and one-action receding-horizon execution. Categorical CEM
+updates its distribution from elite token frequencies with
+`--categorical-alpha` (default `0.7`) and preserves exploration with
+`--categorical-min-prob` (default `0.01`). It requires
+`--action-mode keyboard`. The next MPC call warm-starts by shifting the final
+probability vectors left and resetting the last horizon step to uniform.
+
+Categorical preview and autonomous-step records include
+`action_probabilities` with shape `(horizon, vocabulary_size)` and the matching
+`action_vocabulary`, so convergence and competing directional modes can be
+inspected directly in `events.jsonl`.
 
 ### Artifact contract and run records
 
@@ -265,7 +287,7 @@ As of July 20, 2026:
 - the epoch-146 planner loads against the artifact manifest;
 - constrained CEM outputs were verified to contain only exact keyboard-action
   vocabulary entries;
-- all 33 real-evaluation, latent-alignment, and constant-trajectory unit tests
+- all 36 real-evaluation, latent-alignment, and constant-trajectory unit tests
   pass.
 - dataset replay preflight loads aligned HDF5 start/goal frames and saved
   initial end-effector XY without opening the display, camera, or robot.

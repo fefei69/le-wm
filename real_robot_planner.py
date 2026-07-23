@@ -43,6 +43,9 @@ class CEMConfig:
     smoothness_weight: float = 0.001
     goal_tolerance: float = 0.0
     action_mode: str = "continuous"
+    solver: str = "cem"
+    categorical_alpha: float = 0.7
+    categorical_min_prob: float = 0.01
     seed: int = 3072
 
     def validate(self) -> None:
@@ -53,6 +56,8 @@ class CEMConfig:
             self.action_l2_weight,
             self.smoothness_weight,
             self.goal_tolerance,
+            self.categorical_alpha,
+            self.categorical_min_prob,
         )
         if not np.isfinite(np.asarray(scalar_values, dtype=np.float64)).all():
             raise ValueError("CEM scalar configuration must be finite")
@@ -72,8 +77,16 @@ class CEMConfig:
             raise ValueError("regularization weights must be non-negative")
         if self.goal_tolerance < 0.0:
             raise ValueError("goal_tolerance must be non-negative")
+        if self.solver not in {"cem", "categorical-cem"}:
+            raise ValueError("solver must be 'cem' or 'categorical-cem'")
         if self.action_mode not in {"continuous", "keyboard"}:
             raise ValueError("action_mode must be 'continuous' or 'keyboard'")
+        if self.solver == "categorical-cem" and self.action_mode != "keyboard":
+            raise ValueError("categorical-cem requires action_mode='keyboard'")
+        if not 0.0 < self.categorical_alpha <= 1.0:
+            raise ValueError("categorical_alpha must be in (0, 1]")
+        if not 0.0 <= self.categorical_min_prob < 1.0:
+            raise ValueError("categorical_min_prob must be in [0, 1)")
 
 
 def clamp_action_norm(actions: torch.Tensor, cap_m: float) -> torch.Tensor:
@@ -132,6 +145,70 @@ def quantize_actions(
     ).square().sum(dim=-1)
     indices = distances.argmin(dim=-1)
     return vocabulary.to(actions.device, actions.dtype)[indices]
+
+
+def sample_categorical_indices(
+    probabilities: torch.Tensor,
+    *,
+    num_samples: int,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Sample ``(sample, horizon)`` token indices from per-step probabilities."""
+    if probabilities.ndim != 2 or probabilities.shape[1] < 1:
+        raise ValueError("categorical probabilities must have shape (horizon, tokens)")
+    if num_samples < 1:
+        raise ValueError("categorical sample count must be positive")
+    if not torch.isfinite(probabilities).all() or torch.any(probabilities < 0):
+        raise ValueError("categorical probabilities must be finite and non-negative")
+    row_sums = probabilities.sum(dim=1)
+    if torch.any(row_sums <= 0):
+        raise ValueError("each categorical distribution must have positive mass")
+    normalized = probabilities / row_sums.unsqueeze(1)
+    return torch.multinomial(
+        normalized,
+        num_samples=num_samples,
+        replacement=True,
+        generator=generator,
+    ).transpose(0, 1).contiguous()
+
+
+def categorical_elite_update(
+    probabilities: torch.Tensor,
+    elite_indices: torch.Tensor,
+    *,
+    alpha: float,
+    min_prob: float,
+) -> torch.Tensor:
+    """Update per-step token probabilities from elite categorical samples."""
+    if probabilities.ndim != 2:
+        raise ValueError("categorical probabilities must be two-dimensional")
+    horizon, num_actions = probabilities.shape
+    if elite_indices.ndim != 2 or elite_indices.shape[1] != horizon:
+        raise ValueError("elite indices must have shape (elites, horizon)")
+    if elite_indices.shape[0] < 1:
+        raise ValueError("categorical update requires at least one elite")
+    if torch.any(elite_indices < 0) or torch.any(elite_indices >= num_actions):
+        raise ValueError("elite indices contain an invalid action token")
+    if not 0.0 < float(alpha) <= 1.0:
+        raise ValueError("categorical alpha must be in (0, 1]")
+    if not 0.0 <= float(min_prob) < 1.0 / num_actions:
+        raise ValueError(
+            f"categorical min_prob must be in [0, {1.0 / num_actions:.6g}) "
+            f"for {num_actions} tokens"
+        )
+
+    elite_frequencies = torch.nn.functional.one_hot(
+        elite_indices, num_classes=num_actions
+    ).to(probabilities.dtype).mean(dim=0)
+    updated = (1.0 - float(alpha)) * probabilities + float(alpha) * elite_frequencies
+    updated = updated / updated.sum(dim=1, keepdim=True)
+    if min_prob:
+        # This mixture preserves a strict probability floor while keeping every
+        # row normalized: p' = floor + (1 - K*floor) p.
+        updated = float(min_prob) + (
+            1.0 - num_actions * float(min_prob)
+        ) * updated
+    return updated
 
 
 def compute_training_action_stats(
@@ -229,7 +306,19 @@ class PushBoxPlanner:
             if config.action_mode == "keyboard"
             else None
         )
+        if (
+            config.solver == "categorical-cem"
+            and self.action_vocabulary is not None
+            and config.categorical_min_prob
+            >= 1.0 / int(self.action_vocabulary.shape[0])
+        ):
+            raise ValueError(
+                "categorical_min_prob must be smaller than "
+                f"{1.0 / int(self.action_vocabulary.shape[0]):.6g} for "
+                f"{int(self.action_vocabulary.shape[0])} action tokens"
+            )
         self._previous_plan: torch.Tensor | None = None
+        self._previous_action_probabilities: torch.Tensor | None = None
         self._latent_context: torch.Tensor | None = None
         self._executed_actions: torch.Tensor | None = None
 
@@ -334,6 +423,7 @@ class PushBoxPlanner:
 
     def reset(self) -> None:
         self._previous_plan = None
+        self._previous_action_probabilities = None
         self._latent_context = None
         self._executed_actions = None
 
@@ -417,6 +507,81 @@ class PushBoxPlanner:
             raise RuntimeError("CEM objective produced a non-finite cost")
         return cost
 
+    def _categorical_cem_search(
+        self,
+        latent_context: torch.Tensor,
+        goal_embedding: torch.Tensor,
+    ) -> tuple[torch.Tensor, float, torch.Tensor]:
+        """Search exact keyboard tokens with per-horizon categorical CEM."""
+        if self.action_vocabulary is None:
+            raise RuntimeError("categorical-cem requires an action vocabulary")
+        vocabulary = self.action_vocabulary
+        num_actions = int(vocabulary.shape[0])
+        if self.config.categorical_min_prob >= 1.0 / num_actions:
+            raise ValueError(
+                "--categorical-min-prob must be smaller than "
+                f"{1.0 / num_actions:.6g} for {num_actions} action tokens"
+            )
+        uniform = torch.full(
+            (self.config.horizon, num_actions),
+            1.0 / num_actions,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if self._previous_action_probabilities is None:
+            probabilities = uniform
+        else:
+            previous = self._previous_action_probabilities
+            if previous.shape != uniform.shape:
+                raise RuntimeError("categorical warm-start distribution shape drifted")
+            probabilities = torch.cat([previous[1:], uniform[-1:]], dim=0)
+
+        zero_index = int(
+            torch.argmin(torch.linalg.vector_norm(vocabulary, dim=1)).item()
+        )
+        sampled_best_cost = float("inf")
+        sampled_best_plan: torch.Tensor | None = None
+        for _ in range(self.config.iterations):
+            candidate_indices = sample_categorical_indices(
+                probabilities,
+                num_samples=self.config.num_samples,
+                generator=self.generator,
+            )
+            candidate_indices[0] = probabilities.argmax(dim=1)
+            candidate_indices[1].fill_(zero_index)
+            candidates = vocabulary[candidate_indices]
+            costs = self._rollout_cost(latent_context, goal_embedding, candidates)
+            iteration_best = int(torch.argmin(costs).item())
+            iteration_best_cost = float(costs[iteration_best].item())
+            if iteration_best_cost < sampled_best_cost:
+                sampled_best_cost = iteration_best_cost
+                sampled_best_plan = candidates[iteration_best].detach().clone()
+            elite_rows = torch.topk(
+                costs, k=self.config.elite_count, largest=False
+            ).indices
+            probabilities = categorical_elite_update(
+                probabilities,
+                candidate_indices[elite_rows],
+                alpha=self.config.categorical_alpha,
+                min_prob=self.config.categorical_min_prob,
+            )
+
+        mode_plan = vocabulary[probabilities.argmax(dim=1)]
+        mode_cost = float(
+            self._rollout_cost(
+                latent_context,
+                goal_embedding,
+                mode_plan.unsqueeze(0),
+            )[0].item()
+        )
+        if sampled_best_plan is not None and sampled_best_cost < mode_cost:
+            selected_plan = sampled_best_plan
+            selected_cost = sampled_best_cost
+        else:
+            selected_plan = mode_plan
+            selected_cost = mode_cost
+        return selected_plan, selected_cost, probabilities
+
     @torch.inference_mode()
     def predict_next_latent(self, action: Any) -> dict[str, np.ndarray]:
         """Predict one transition from the current MPC context without mutation."""
@@ -499,88 +664,114 @@ class PushBoxPlanner:
                 "goal_distance": goal_distance,
                 "solve_time_s": time.monotonic() - started,
                 "at_goal": True,
+                "solver": self.config.solver,
             }
 
-        shape = (self.config.num_samples, self.config.horizon, ACTION_DIM)
-        if self._previous_plan is None:
-            mean = torch.zeros(
-                self.config.horizon,
-                ACTION_DIM,
-                dtype=torch.float32,
-                device=self.device,
-            )
-        else:
-            mean = torch.cat(
-                [
-                    self._previous_plan[1:],
-                    torch.zeros(1, ACTION_DIM, device=self.device),
-                ],
-                dim=0,
-            )
-        std = torch.full_like(mean, self.config.initial_std_m)
-
-        sampled_best_cost = float("inf")
-        sampled_best_plan: torch.Tensor | None = None
-        for _ in range(self.config.iterations):
-            candidates = torch.randn(
-                shape,
-                generator=self.generator,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            candidates = candidates * std.unsqueeze(0) + mean.unsqueeze(0)
-            candidates[0] = mean
-            candidates[1].zero_()
-            candidates = self._constrain_actions(candidates)
-            costs = self._rollout_cost(
-                self._latent_context, goal_embedding, candidates
-            )
-            iteration_best = int(torch.argmin(costs).item())
-            iteration_best_cost = float(costs[iteration_best].item())
-            if iteration_best_cost < sampled_best_cost:
-                sampled_best_cost = iteration_best_cost
-                sampled_best_plan = candidates[iteration_best].detach().clone()
-            elite_indices = torch.topk(
-                costs, k=self.config.elite_count, largest=False
-            ).indices
-            elites = candidates[elite_indices]
-            mean = clamp_action_norm(
-                elites.mean(dim=0), self.config.action_cap_m
-            )
-            std = elites.std(dim=0, unbiased=False).clamp_min(
-                self.config.min_std_m
-            )
-        mean_plan = self._constrain_actions(mean.unsqueeze(0))[0]
-        mean_cost = float(
-            self._rollout_cost(
+        action_probabilities: np.ndarray | None = None
+        if self.config.solver == "categorical-cem":
+            (
+                selected_plan,
+                selected_cost,
+                final_probabilities,
+            ) = self._categorical_cem_search(
                 self._latent_context,
                 goal_embedding,
-                mean_plan.unsqueeze(0),
-            )[0].item()
-        )
-        if sampled_best_plan is not None and sampled_best_cost < mean_cost:
-            selected_plan = sampled_best_plan
-            selected_cost = sampled_best_cost
+            )
+            self._previous_action_probabilities = (
+                final_probabilities.detach().clone()
+            )
+            action_probabilities = (
+                final_probabilities.detach().cpu().numpy().astype(np.float32)
+            )
         else:
-            selected_plan = mean_plan
-            selected_cost = mean_cost
+            shape = (self.config.num_samples, self.config.horizon, ACTION_DIM)
+            if self._previous_plan is None:
+                mean = torch.zeros(
+                    self.config.horizon,
+                    ACTION_DIM,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            else:
+                mean = torch.cat(
+                    [
+                        self._previous_plan[1:],
+                        torch.zeros(1, ACTION_DIM, device=self.device),
+                    ],
+                    dim=0,
+                )
+            std = torch.full_like(mean, self.config.initial_std_m)
+
+            sampled_best_cost = float("inf")
+            sampled_best_plan: torch.Tensor | None = None
+            for _ in range(self.config.iterations):
+                candidates = torch.randn(
+                    shape,
+                    generator=self.generator,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                candidates = candidates * std.unsqueeze(0) + mean.unsqueeze(0)
+                candidates[0] = mean
+                candidates[1].zero_()
+                candidates = self._constrain_actions(candidates)
+                costs = self._rollout_cost(
+                    self._latent_context, goal_embedding, candidates
+                )
+                iteration_best = int(torch.argmin(costs).item())
+                iteration_best_cost = float(costs[iteration_best].item())
+                if iteration_best_cost < sampled_best_cost:
+                    sampled_best_cost = iteration_best_cost
+                    sampled_best_plan = candidates[iteration_best].detach().clone()
+                elite_indices = torch.topk(
+                    costs, k=self.config.elite_count, largest=False
+                ).indices
+                elites = candidates[elite_indices]
+                mean = clamp_action_norm(
+                    elites.mean(dim=0), self.config.action_cap_m
+                )
+                std = elites.std(dim=0, unbiased=False).clamp_min(
+                    self.config.min_std_m
+                )
+            mean_plan = self._constrain_actions(mean.unsqueeze(0))[0]
+            mean_cost = float(
+                self._rollout_cost(
+                    self._latent_context,
+                    goal_embedding,
+                    mean_plan.unsqueeze(0),
+                )[0].item()
+            )
+            if sampled_best_plan is not None and sampled_best_cost < mean_cost:
+                selected_plan = sampled_best_plan
+                selected_cost = sampled_best_cost
+            else:
+                selected_plan = mean_plan
+                selected_cost = mean_cost
 
         self._previous_plan = selected_plan.detach().clone()
         plan = selected_plan.detach().cpu().numpy().astype(np.float32)
         if not np.isfinite(plan).all() or not np.isfinite(selected_cost):
             raise RuntimeError("CEM produced a non-finite plan or cost")
-        return {
+        result = {
             "action": plan[0].copy(),
             "plan": plan,
             "cost": selected_cost,
             "goal_distance": goal_distance,
             "solve_time_s": time.monotonic() - started,
             "at_goal": False,
+            "solver": self.config.solver,
         }
+        if action_probabilities is not None:
+            result["action_probabilities"] = action_probabilities
+            result["action_vocabulary"] = (
+                self.action_vocabulary.detach().cpu().numpy().astype(np.float32)
+            )
+        return result
 
 
 def serve(args: argparse.Namespace) -> int:
     config = CEMConfig(
+        solver=args.solver,
         horizon=args.horizon,
         num_samples=args.num_samples,
         iterations=args.iterations,
@@ -592,6 +783,8 @@ def serve(args: argparse.Namespace) -> int:
         smoothness_weight=args.smoothness_weight,
         goal_tolerance=args.goal_tolerance,
         action_mode=args.action_mode,
+        categorical_alpha=args.categorical_alpha,
+        categorical_min_prob=args.categorical_min_prob,
         seed=args.seed,
     )
     planner = PushBoxPlanner.from_artifacts(
@@ -666,6 +859,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dataset", default="stable-wm/datasets/pushbox_pilot_train.h5"
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--solver",
+        choices=("cem", "categorical-cem"),
+        default="cem",
+        help="Gaussian CEM or direct categorical search over keyboard tokens",
+    )
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--num-samples", type=int, default=256)
     parser.add_argument("--iterations", type=int, default=5)
@@ -682,6 +881,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--action-l2-weight", type=float, default=0.001)
     parser.add_argument("--smoothness-weight", type=float, default=0.001)
     parser.add_argument("--goal-tolerance", type=float, default=0.0)
+    parser.add_argument("--categorical-alpha", type=float, default=0.7)
+    parser.add_argument("--categorical-min-prob", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--artifact-manifest")
     return parser

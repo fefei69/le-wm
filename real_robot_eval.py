@@ -105,6 +105,67 @@ def validate_planner_result(
     )
 
 
+def validate_solver_diagnostics(
+    result: dict[str, Any],
+    *,
+    expected_solver: str,
+    plan: np.ndarray,
+    horizon: int,
+    cap_m: float,
+    at_goal: bool,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Validate optional categorical probabilities before saving diagnostics."""
+    returned_solver = str(result.get("solver", ""))
+    if returned_solver != expected_solver:
+        raise ValueError(
+            f"planner returned solver {returned_solver!r}, expected {expected_solver!r}"
+        )
+    raw_probabilities = result.get("action_probabilities")
+    raw_vocabulary = result.get("action_vocabulary")
+    if expected_solver == "cem":
+        if raw_probabilities is not None or raw_vocabulary is not None:
+            raise ValueError("Gaussian CEM returned categorical diagnostics")
+        return None, None
+    if at_goal and raw_probabilities is None and raw_vocabulary is None:
+        return None, None
+    if raw_probabilities is None or raw_vocabulary is None:
+        raise ValueError("categorical-cem did not return its action distribution")
+
+    probabilities = np.asarray(raw_probabilities, dtype=np.float64)
+    vocabulary = np.asarray(raw_vocabulary, dtype=np.float64)
+    if vocabulary.ndim != 2 or vocabulary.shape[1] != 2:
+        raise ValueError("categorical action vocabulary must have shape (tokens, 2)")
+    expected_shape = (int(horizon), vocabulary.shape[0])
+    if probabilities.shape != expected_shape:
+        raise ValueError(
+            f"categorical probabilities must have shape {expected_shape}, "
+            f"got {probabilities.shape}"
+        )
+    if (
+        not np.isfinite(probabilities).all()
+        or np.any(probabilities < 0.0)
+        or not np.allclose(probabilities.sum(axis=1), 1.0, rtol=0.0, atol=1e-5)
+    ):
+        raise ValueError("categorical probabilities must be finite normalized rows")
+    if not np.isfinite(vocabulary).all():
+        raise ValueError("categorical action vocabulary must be finite")
+    if np.any(np.linalg.norm(vocabulary, axis=1) > float(cap_m) + 1e-7):
+        raise ValueError("categorical action vocabulary exceeds the action cap")
+    selected_plan = np.asarray(plan, dtype=np.float64)
+    matches = np.all(
+        np.isclose(
+            selected_plan[:, None, :],
+            vocabulary[None, :, :],
+            rtol=0.0,
+            atol=1e-7,
+        ),
+        axis=2,
+    )
+    if not np.all(np.any(matches, axis=1)):
+        raise ValueError("categorical plan contains an action outside its vocabulary")
+    return probabilities.astype(np.float32), vocabulary.astype(np.float32)
+
+
 def validate_transition_prediction(
     result: dict[str, Any], *, action: Any, latent_dim: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1091,6 +1152,8 @@ class PlannerProcess:
             str(self.args.dataset),
             "--device",
             self.args.device,
+            "--solver",
+            self.args.solver,
             "--horizon",
             str(self.args.horizon),
             "--num-samples",
@@ -1105,6 +1168,10 @@ class PlannerProcess:
             self.args.action_mode,
             "--goal-tolerance",
             str(self.args.goal_tolerance),
+            "--categorical-alpha",
+            str(self.args.categorical_alpha),
+            "--categorical-min-prob",
+            str(self.args.categorical_min_prob),
             "--seed",
             str(self.args.seed),
         ]
@@ -1250,6 +1317,15 @@ def _build_parser(repo_root: Path) -> argparse.ArgumentParser:
         help="zero-based goal step within --dataset-episode",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--solver",
+        choices=("cem", "categorical-cem"),
+        default="cem",
+        help=(
+            "cem samples Gaussian XY vectors then constrains them; "
+            "categorical-cem samples exact keyboard-action tokens"
+        ),
+    )
     parser.add_argument("--follower-ip", default="192.168.1.3")
     parser.add_argument("--fixed-z", type=float, default=0.03)
     parser.add_argument("--safe-z", type=float, default=0.15)
@@ -1298,6 +1374,18 @@ def _build_parser(repo_root: Path) -> argparse.ArgumentParser:
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--elite-count", type=int, default=32)
     parser.add_argument("--goal-tolerance", type=float, default=0.0)
+    parser.add_argument(
+        "--categorical-alpha",
+        type=float,
+        default=0.7,
+        help="elite-frequency update weight for --solver categorical-cem",
+    )
+    parser.add_argument(
+        "--categorical-min-prob",
+        type=float,
+        default=0.01,
+        help="per-token exploration floor for --solver categorical-cem",
+    )
     parser.add_argument("--planner-start-timeout", type=float, default=120.0)
     parser.add_argument("--planner-timeout", type=float, default=DEFAULT_PLANNER_TIMEOUT_S)
     parser.add_argument("--max-plan-age", type=float, default=DEFAULT_MAX_PLAN_AGE_S)
@@ -1604,12 +1692,22 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         "--xy-tracking-tolerance": args.xy_tracking_tolerance,
         "--orientation-tolerance": args.orientation_tolerance,
         "--settled-linear-speed": args.settled_linear_speed,
+        "--categorical-alpha": args.categorical_alpha,
     }
     for name, value in positive_values.items():
         if not np.isfinite(value) or value <= 0.0:
             parser.error(f"{name} must be finite and positive")
     if not np.isfinite(args.tracking_settle_grace) or args.tracking_settle_grace < 0.0:
         parser.error("--tracking-settle-grace must be finite and non-negative")
+    if args.categorical_alpha > 1.0:
+        parser.error("--categorical-alpha must be at most 1")
+    if (
+        not np.isfinite(args.categorical_min_prob)
+        or not 0.0 <= args.categorical_min_prob < 1.0
+    ):
+        parser.error("--categorical-min-prob must be finite and in [0, 1)")
+    if args.solver == "categorical-cem" and args.action_mode != "keyboard":
+        parser.error("--solver categorical-cem requires --action-mode keyboard")
     if args.motion_settle_timeout <= TICK_S + args.tracking_settle_grace:
         parser.error(
             "--motion-settle-timeout must exceed the 0.2 s command time plus "
@@ -1678,7 +1776,8 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     print(f"Starting real PushBox evaluation in {mode_name} mode")
     print(
         "Planner configuration: "
-        f"action_mode={args.action_mode}, horizon={args.horizon}, "
+        f"solver={args.solver}, action_mode={args.action_mode}, "
+        f"horizon={args.horizon}, "
         f"samples={args.num_samples}, iterations={args.iterations}, "
         f"elites={args.elite_count}, action_cap={args.action_cap:g} m, "
         f"max_actions={args.max_actions}"
@@ -1831,6 +1930,8 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         latest_cost: float | None = None
         latest_solve_s: float | None = None
         latest_goal_distance: float | None = None
+        latest_action_probabilities: np.ndarray | None = None
+        latest_action_vocabulary: np.ndarray | None = None
         next_plan_time = 0.0
         previous_executed_action: np.ndarray | None = None
         faulted = False
@@ -2102,6 +2203,17 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                     cap_m=args.action_cap,
                                     horizon=args.horizon,
                                 )
+                                (
+                                    latest_action_probabilities,
+                                    latest_action_vocabulary,
+                                ) = validate_solver_diagnostics(
+                                    result,
+                                    expected_solver=args.solver,
+                                    plan=latest_plan,
+                                    horizon=args.horizon,
+                                    cap_m=args.action_cap,
+                                    at_goal=at_goal,
+                                )
                             except (KeyError, TypeError, ValueError) as exc:
                                 latch_fault(f"unsafe planner output: {exc}")
 
@@ -2133,6 +2245,9 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                 plan_age_s=plan_age_s,
                                 settle_to_capture_s=pending_settle_to_capture_s,
                                 at_goal=True,
+                                solver=args.solver,
+                                action_probabilities=latest_action_probabilities,
+                                action_vocabulary=latest_action_vocabulary,
                             )
                             print("preview reports that the current scene is already at goal")
                         elif autonomous:
@@ -2265,6 +2380,9 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                         planner_feedback_action=planner_feedback_action,
                                         planner_action_negated=args.negate_planner_action,
                                         plan=latest_plan,
+                                        solver=args.solver,
+                                        action_probabilities=latest_action_probabilities,
+                                        action_vocabulary=latest_action_vocabulary,
                                         cost=latest_cost,
                                         goal_distance=latest_goal_distance,
                                         solve_time_s=latest_solve_s,
@@ -2309,6 +2427,9 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                 robot_action=preview_robot_action,
                                 planner_action_negated=args.negate_planner_action,
                                 plan=latest_plan,
+                                solver=args.solver,
+                                action_probabilities=latest_action_probabilities,
+                                action_vocabulary=latest_action_vocabulary,
                                 cost=latest_cost,
                                 goal_distance=latest_goal_distance,
                                 solve_time_s=latest_solve_s,
