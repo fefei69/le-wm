@@ -153,3 +153,62 @@ visual quality directly to dynamics prediction.
 | Training improves but validation worsens with depth | Overfitting or unpredictable target detail | Add regularization/data; do not increase capacity further |
 | Prediction loss is unchanged but decoder improves | Representation is more decodable, not more predictable | Revisit the prediction target/objective |
 | Prediction loss improves but decoder is unchanged | Dynamics capacity improved without changing single-frame information | Prioritize rollout evaluation over reconstruction |
+| Both training and validation worsen with depth | Not a capacity limit; deeper stack optimizes worse under the fixed recipe | Keep depth 6; retune optimization before any further capacity claim |
+
+## Results (2026-07-22)
+
+All three runs completed 150 epochs. `fit/pred_loss` is the final logged
+training-step value; the validation columns come from `validate/pred_loss_epoch`.
+
+| Depth | Predictor params | `fit/pred_loss` | Best val pred (epoch) | Final val pred | Last-20 val mean ± sd | Runtime |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 6 (baseline) | 24.2M | 0.003255 | **0.004959** (120) | **0.004995** | **0.005031 ± 0.000018** | 3:31:00 |
+| 8 | 32.3M | 0.003425 | 0.005592 (123) | 0.005599 | 0.005629 ± 0.000023 | 3:24:08 |
+| 10 | 40.4M | 0.003563 | 0.005599 (146) | 0.005614 | 0.005640 ± 0.000023 | 3:55:55 |
+
+Matched projected-latent decoder probes (patch 14, seed 3072, 20k steps, epoch-150
+checkpoint):
+
+| Depth | Decoder val MSE | Decoder PSNR |
+| ---: | ---: | ---: |
+| 6 | **0.02942** | **28.258 dB** |
+| 8 | 0.03043 | 28.108 dB |
+| 10 | 0.03070 | 28.071 dB |
+
+### Verdict: H1 rejected, H2 rejected, H3 supported
+
+Depth made every measured quantity worse, monotonically:
+
+- Validation prediction loss rose 12.7% at depth 8 and 13.1% at depth 10.
+- Training prediction loss also rose, by 5.2% and 9.5%. **This rules out H2.**
+  Overfitting requires training loss to improve while validation degrades; here
+  the deeper models fit the training data *less* well.
+- The decoder probe moved 0.15-0.19 dB the wrong way, so the added depth did not
+  buy a more decodable representation either.
+
+The validation gap is far outside within-run noise: late-epoch sd is about
+2e-5, while the depth-6 to depth-8 difference is 6e-4, roughly 26 sd. The
+train/validation ratio is essentially unchanged across depths (1.53, 1.63,
+1.58), which is again inconsistent with a capacity-driven overfitting story.
+
+The remaining explanation is H3 combined with an optimization effect: the
+six-layer predictor is not the bottleneck, and at a fixed 150 epochs, lr `5e-5`,
+and dropout 0.1 the deeper causal stack simply optimizes worse.
+
+### What this does not establish
+
+- Each depth is a **single seed**. The effect is large relative to epoch-to-epoch
+  noise but seed variance was not measured.
+- The optimization recipe was deliberately held fixed and therefore was not
+  retuned for depth. Deeper transformers typically want warmup or a different
+  learning rate, so the honest claim is "depth hurts under this recipe", not
+  "predictor depth cannot help".
+- No rollout evaluation was run, so nothing here speaks to multi-step drift.
+
+### Follow-up
+
+Keep depth 6. Do not spend further compute widening or deepening the predictor
+on the strength of this sweep. The productive next step is the action-conditioned
+rollout evaluation already described above, which separates "predicts the next
+latent" from "responds to actions" — a distinction none of these one-step numbers
+can make.
