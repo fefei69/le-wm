@@ -1,4 +1,5 @@
 import argparse
+import h5py
 import imageio.v3 as iio
 import json
 import numpy as np
@@ -12,12 +13,15 @@ from real_robot_eval import (
     DEFAULT_SETTLED_LINEAR_SPEED_M_S,
     GoalFrameSelectorState,
     PlannerProcess,
+    RealRobotUI,
     RunRecorder,
     UIEvents,
     _workspace_bounds,
+    load_dataset_frame_pair,
     load_external_goal,
     motion_completion_status,
     prioritize_ui_events,
+    resolve_dataset_episode,
     snapshot_follows_settle,
     transform_planner_action,
     validate_measured_pose,
@@ -248,6 +252,98 @@ class RealRobotSafetyTests(unittest.TestCase):
                 goal_video_frame=None,
                 transform_profile=UnexpectedTransform(),
             )
+
+    def test_dataset_frame_pair_loads_images_and_saved_initial_xy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset_path = Path(directory, "fixture.h5")
+            pixels = np.zeros((6, 224, 224, 3), dtype=np.uint8)
+            pixels[1].fill(11)
+            pixels[3].fill(33)
+            state = np.full((6, 6), np.nan, dtype=np.float32)
+            state[:, :2] = np.array(
+                [
+                    [0.10, 0.00],
+                    [0.11, 0.01],
+                    [0.12, 0.02],
+                    [0.13, 0.03],
+                    [0.20, -0.01],
+                    [0.21, -0.02],
+                ],
+                dtype=np.float32,
+            )
+            with h5py.File(dataset_path, "w") as dataset:
+                dataset.create_dataset("pixels", data=pixels)
+                dataset.create_dataset("state", data=state)
+                dataset.create_dataset("episode_idx", data=[7, 7, 7, 7, 9, 9])
+                dataset.create_dataset("step_idx", data=[0, 1, 2, 3, 0, 1])
+
+            pair = load_dataset_frame_pair(
+                dataset_path, episode_id=7, initial_step=1, goal_step=3
+            )
+            self.assertTrue(np.all(pair.initial_frame == 11))
+            self.assertTrue(np.all(pair.goal_frame == 33))
+            np.testing.assert_allclose(pair.initial_xy, [0.11, 0.01])
+            self.assertEqual(pair.metadata["episode_id"], 7)
+            self.assertEqual(pair.metadata["initial_step"], 1)
+            self.assertEqual(pair.metadata["goal_step"], 3)
+
+            with self.assertRaisesRegex(ValueError, "later"):
+                load_dataset_frame_pair(
+                    dataset_path, episode_id=7, initial_step=3, goal_step=1
+                )
+            with self.assertRaisesRegex(ValueError, "does not exist"):
+                load_dataset_frame_pair(
+                    dataset_path, episode_id=8, initial_step=0, goal_step=1
+                )
+
+            ui = RealRobotUI(object(), initial_reference=pair.initial_frame)
+            np.testing.assert_array_equal(ui.initial_reference, pair.initial_frame)
+
+    def test_dataset_episode_accepts_readable_video_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            dataset_path = temporary_root / "merged.h5"
+            with h5py.File(dataset_path, "w") as dataset:
+                dataset.create_dataset("episode_idx", data=[0, 0, 1, 1, 2, 2])
+                dataset.attrs["source_files_json"] = (
+                    '["/data/pushbox_keyboard_20260715_180541.h5", '
+                    '"/data/pushbox_keyboard_20260715_195406.h5"]'
+                )
+
+            video_root = temporary_root / "datasets_videos"
+            first_session = video_root / "20260715_180541"
+            second_session = video_root / "20260715_195406"
+            first_session.mkdir(parents=True)
+            second_session.mkdir(parents=True)
+            (first_session / "ep_000.mp4").touch()
+            (first_session / "ep_001.mp4").touch()
+            (second_session / "ep_000.mp4").touch()
+
+            resolved = resolve_dataset_episode(
+                dataset_path,
+                Path("datasets_videos/20260715_195406/ep_000.mp4"),
+                repo_root=temporary_root,
+            )
+            self.assertEqual(resolved.episode_id, 2)
+            self.assertEqual(resolved.session_id, "20260715_195406")
+            self.assertEqual(resolved.local_episode_id, 0)
+            self.assertEqual(
+                resolved.provenance()["video_path"],
+                str((second_session / "ep_000.mp4").resolve()),
+            )
+
+            numeric = resolve_dataset_episode(
+                dataset_path, "9", repo_root=temporary_root
+            )
+            self.assertEqual(numeric.episode_id, 9)
+            self.assertIsNone(numeric.video_path)
+
+            with self.assertRaisesRegex(ValueError, "does not exist"):
+                resolve_dataset_episode(
+                    dataset_path,
+                    Path("datasets_videos/20260715_180541/missing.mp4"),
+                    repo_root=temporary_root,
+                )
 
     def test_validate_measured_pose_checks_tracking_and_workspace(self):
         pose = np.array([0.14, 0.02, 0.03, 0.0, np.pi / 2, 0.0])

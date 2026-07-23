@@ -31,6 +31,8 @@ The evaluator now provides:
   labels, and controlled shutdown;
 - optional startup goals loaded from a 224x224 image or an explicitly indexed
   frame in a dataset MP4;
+- aligned HDF5 episode replay with operator-selected initial/goal frames and
+  automatic restoration of the initial saved end-effector XY;
 - one-step receding-horizon MPC: CEM plans a full horizon, but only its first
   action is executed before observing and replanning;
 - finite workspace, pose, orientation, action-norm, planner-age, camera-age,
@@ -103,6 +105,7 @@ and large diagnostic artifacts are not accidentally committed.
 
 | Tool | Purpose |
 | --- | --- |
+| `scripts/postprocess_real_run.py` | Create a side-by-side raw-observation/goal MP4, plot recorded planner cost, and add optional box/EE pixel-tracking checks for one trial. |
 | `scripts/replay_real_cem_latents.py` | Re-encode recorded PNGs, reconstruct planner history, replay each selected CEM plan, decode every predicted horizon state, and report predicted-versus-real one-step errors. |
 | `scripts/render_real_latent_alignment.py` | Decode saved live `z`/`z_hat` arrays and create the three-row time-aligned raw/encoded/predicted figure. |
 | `scripts/probe_pushbox_latent_rollout.py` | Apply a constant synthetic XY action from one real image and decode the open-loop latent trajectory. |
@@ -115,6 +118,32 @@ same world-model checkpoint. The CEM replay tool rejects mismatched decoder and
 world-model checkpoints by default. Only the first predicted state of a plan is
 directly comparable with the next real image because live MPC replans after
 every action.
+
+The lightweight run overview does not load the model or require a decoder:
+
+```bash
+.venv/bin/python scripts/postprocess_real_run.py \
+  --run RUN_ID \
+  --trial-id 1
+```
+
+It writes `raw_vs_goal.mp4`, `planning_loss.png`,
+`planning_metrics.csv`, and `summary.json` under
+`RUN/analysis/overview_trial_001/`. Each raw video frame is the observation
+used for that autonomous action. “Planning loss” means the recorded CEM
+objective in `autonomous_step.cost`; it is not a world-model training loss.
+The plot uses elapsed monotonic wall time, while the CSV also includes step,
+latent goal distance, and solve time. `--run` accepts either a full/relative
+run-directory path or a bare directory name found under `real_robot_runs/`.
+
+As an additional check, it also writes `tracking_check.mp4`,
+`tracking_errors.png`, and `tracking_metrics.csv`.  The box coordinate is the
+large red-patch centroid; the EE proxy is the small red pusher-tip centroid.
+The latter uses temporal continuity but remains an intentionally approximate
+visual check.  Missing detections are recorded as NaN and do not affect the
+primary video or planner-cost artifacts.  Goal-relative box and EE distances
+are kept separate and reported in image pixels.  The final sample is the last
+saved pre-action observation, not necessarily a terminal post-action frame.
 
 ### Commands
 
@@ -163,6 +192,52 @@ cancels without starting the planner, camera, or robot. Add
 `--goal-video-frame 42` to bypass the selector; this explicit form is required
 when combining a video goal with `--preflight`.
 
+### Replay an aligned dataset start and goal
+
+Use `--dataset-episode ID_OR_VIDEO` when the initial scene should also come
+from the planner's HDF5 dataset. It accepts either the merged integer episode
+ID or its readable source-video path, for example
+`datasets_videos/20260715_180541/ep_003.mp4`. The path form validates the
+video inventory against the HDF5 `source_files_json` order and resolves this
+example to merged episode 166. The original path and both IDs are retained in
+run metadata.
+
+The selector first asks for an initial step and then a later goal step.
+Left/Right navigates, `1`/`5` changes the stride, Enter accepts the displayed
+step, Backspace returns to initial-step selection, and Esc/Q cancels before the
+planner, camera, or robot starts.
+
+```bash
+# Interactive selection with camera/UI but no robot motion.
+scripts/eval_pushbox_real.sh --dry-run \
+  --dataset-episode datasets_videos/20260715_180541/ep_003.mp4
+
+# Reproducible no-display preflight.
+scripts/eval_pushbox_real.sh --dry-run --preflight \
+  --dataset-episode datasets_videos/20260715_180541/ep_003.mp4 \
+  --initial-step 10 --goal-step 80
+
+# Live replay. This launcher defaults to robot execution.
+scripts/eval_pushbox_real.sh \
+  --dataset-episode datasets_videos/20260715_180541/ep_003.mp4 \
+  --initial-step 10 --goal-step 80
+
+# The legacy merged integer ID remains supported.
+scripts/eval_pushbox_real.sh --dry-run --dataset-episode 166
+```
+
+Both images come directly from the selected episode's `pixels` rows. The
+initial end-effector XY comes from `state[initial_step, :2]`, replaces
+`--start-x/--start-y`, and is checked against the commissioned workspace before
+the robot is connected. Live startup follows the existing home -> safe-Z ->
+fixed-Z path at that XY, and `r` resets to the same saved position.
+
+The live window shows `CURRENT | DATASET START | GOAL`. Run records preserve
+both images, episode and step IDs, dataset row indices, and the selected XY.
+Only the arm position is restored automatically: box position/yaw are not
+recorded in this dataset, so manually match the box to `DATASET START` before
+pressing `v` or `p`. The goal step must be later than the initial step.
+
 Replay selected plans from a recorded run:
 
 ```bash
@@ -190,5 +265,7 @@ As of July 20, 2026:
 - the epoch-146 planner loads against the artifact manifest;
 - constrained CEM outputs were verified to contain only exact keyboard-action
   vocabulary entries;
-- all 25 real-evaluation, latent-alignment, and constant-trajectory unit tests
+- all 33 real-evaluation, latent-alignment, and constant-trajectory unit tests
   pass.
+- dataset replay preflight loads aligned HDF5 start/goal frames and saved
+  initial end-effector XY without opening the display, camera, or robot.

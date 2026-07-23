@@ -17,6 +17,7 @@ import json
 from multiprocessing.connection import Client
 import os
 from pathlib import Path
+import re
 import secrets
 import subprocess
 import sys
@@ -231,7 +232,7 @@ def _sha256(path: Path) -> str:
 
 @dataclass
 class GoalFrameSelectorState:
-    """Testable navigation state for the dataset-video goal selector."""
+    """Testable navigation state shared by video and HDF5 frame selectors."""
 
     frame_count: int
     frame_index: int = 0
@@ -239,20 +240,20 @@ class GoalFrameSelectorState:
 
     def __post_init__(self) -> None:
         if self.frame_count < 1:
-            raise ValueError("goal video must contain at least one frame")
+            raise ValueError("frame source must contain at least one frame")
         if not 0 <= self.frame_index < self.frame_count:
-            raise ValueError("initial goal frame is outside the video")
+            raise ValueError("initial selector frame is outside the source")
         self.set_stride(self.stride)
 
     def set_stride(self, stride: int) -> None:
         if stride not in (1, 5):
-            raise ValueError("goal frame selector stride must be 1 or 5")
+            raise ValueError("frame selector stride must be 1 or 5")
         self.stride = int(stride)
 
     def move(self, direction: int) -> bool:
         """Move one active stride left/right and report whether it changed."""
         if direction not in (-1, 1):
-            raise ValueError("goal frame direction must be -1 or +1")
+            raise ValueError("frame direction must be -1 or +1")
         next_index = int(
             np.clip(
                 self.frame_index + direction * self.stride,
@@ -265,59 +266,51 @@ class GoalFrameSelectorState:
         return changed
 
 
-def select_goal_video_frame(video_path: Path) -> int | None:
-    """Show a small keyboard UI and return the confirmed zero-based frame.
-
-    This function is called before planner, camera, or robot initialization.
-    Returning ``None`` means the operator cancelled safely.
-    """
-    path = video_path.expanduser().resolve()
-    if not path.is_file():
-        raise ValueError(f"goal video does not exist: {path}")
+def _select_frame_indices(
+    *,
+    frame_count: int,
+    read_frame: Any,
+    source_label: str,
+    selection_labels: tuple[str, ...],
+    fps: float = 0.0,
+    require_increasing: bool = False,
+) -> tuple[int, ...] | None:
+    """Select one or more frame indices with a shared keyboard UI."""
     try:
-        import cv2
         import pygame
     except ImportError as exc:
-        raise RuntimeError(
-            "interactive goal selection requires OpenCV and pygame"
-        ) from exc
+        raise RuntimeError("interactive frame selection requires pygame") from exc
+    if not selection_labels:
+        raise ValueError("frame selector requires at least one selection stage")
 
-    capture = cv2.VideoCapture(str(path))
-    if not capture.isOpened():
-        capture.release()
-        raise ValueError(f"failed to open goal video: {path}")
-    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    if frame_count < 1:
-        capture.release()
-        raise ValueError(f"goal video contains no seekable frames: {path}")
     state = GoalFrameSelectorState(frame_count=frame_count)
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
-    if not np.isfinite(fps) or fps <= 0.0:
-        fps = 0.0
+    selected: list[int] = []
+    phase = 0
+    notice = ""
 
-    def read_frame() -> np.ndarray:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, state.frame_index)
-        ok, bgr = capture.read()
-        if not ok or bgr is None:
+    def checked_frame() -> np.ndarray:
+        frame = np.asarray(read_frame(state.frame_index))
+        if frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8:
             raise ValueError(
-                f"failed to decode frame {state.frame_index} from {path}"
+                f"frame {state.frame_index} must be RGB uint8, got "
+                f"{frame.shape} {frame.dtype}"
             )
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        return frame
 
     pygame_initialized = False
     try:
-        rgb = read_frame()
+        rgb = checked_frame()
         frame_height, frame_width = rgb.shape[:2]
         scale = max(1, min(3, 900 // frame_width, 650 // frame_height))
         display_size = (frame_width * scale, frame_height * scale)
-        status_height = 92
+        status_height = 116
 
         pygame.init()
         pygame_initialized = True
         screen = pygame.display.set_mode(
             (display_size[0], display_size[1] + status_height)
         )
-        pygame.display.set_caption("Select PushBox goal frame")
+        pygame.display.set_caption(f"Select PushBox {selection_labels[phase]} frame")
         title_font = pygame.font.Font(None, 28)
         help_font = pygame.font.Font(None, 22)
         clock = pygame.time.Clock()
@@ -331,17 +324,50 @@ def select_goal_video_frame(video_path: Path) -> int | None:
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     return None
                 if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                    return state.frame_index
-                if event.key in (pygame.K_1, pygame.K_KP1):
+                    if (
+                        require_increasing
+                        and phase == 0
+                        and state.frame_index >= frame_count - 1
+                    ):
+                        notice = "Initial frame must leave at least one later goal frame."
+                        continue
+                    if (
+                        require_increasing
+                        and selected
+                        and state.frame_index <= selected[-1]
+                    ):
+                        notice = "Goal frame must be later than the initial frame."
+                        continue
+                    selected.append(state.frame_index)
+                    notice = ""
+                    if len(selected) == len(selection_labels):
+                        return tuple(selected)
+                    phase += 1
+                    state.frame_index = min(state.frame_index + 1, frame_count - 1)
+                    rgb = checked_frame()
+                    pygame.display.set_caption(
+                        f"Select PushBox {selection_labels[phase]} frame"
+                    )
+                elif event.key == pygame.K_BACKSPACE and selected:
+                    phase -= 1
+                    state.frame_index = selected.pop()
+                    notice = ""
+                    rgb = checked_frame()
+                    pygame.display.set_caption(
+                        f"Select PushBox {selection_labels[phase]} frame"
+                    )
+                elif event.key in (pygame.K_1, pygame.K_KP1):
                     state.set_stride(1)
                 elif event.key in (pygame.K_5, pygame.K_KP5):
                     state.set_stride(5)
                 elif event.key == pygame.K_TAB:
                     state.set_stride(5 if state.stride == 1 else 1)
                 elif event.key == pygame.K_LEFT and state.move(-1):
-                    rgb = read_frame()
+                    notice = ""
+                    rgb = checked_frame()
                 elif event.key == pygame.K_RIGHT and state.move(1):
-                    rgb = read_frame()
+                    notice = ""
+                    rgb = checked_frame()
 
             frame_surface = pygame.image.frombuffer(
                 np.ascontiguousarray(rgb).tobytes(),
@@ -355,27 +381,375 @@ def select_goal_video_frame(video_path: Path) -> int | None:
             time_text = (
                 f"  |  {state.frame_index / fps:.2f} s" if fps > 0.0 else ""
             )
+            prior_text = "" if not selected else f"  |  initial={selected[0]}"
             title = title_font.render(
-                f"Frame {state.frame_index} / {state.frame_count - 1}{time_text}"
-                f"  |  skip mode: {state.stride}",
+                f"Select {selection_labels[phase]}: frame {state.frame_index} / "
+                f"{state.frame_count - 1}{time_text}{prior_text}  |  skip={state.stride}",
                 True,
                 (245, 245, 245),
             )
-            help_line = help_font.render(
-                "Left/Right: move   1 or 5: skip mode   Enter: select   Esc/Q: cancel",
-                True,
-                (195, 205, 215),
+            help_text = (
+                "Left/Right: move   1 or 5: skip   Enter: select   "
+                + ("Backspace: previous   " if len(selection_labels) > 1 else "")
+                + "Esc/Q: cancel"
             )
-            screen.blit(title, (12, display_size[1] + 14))
-            screen.blit(help_line, (12, display_size[1] + 51))
+            help_line = help_font.render(help_text, True, (195, 205, 215))
+            source_line = help_font.render(source_label, True, (165, 180, 195))
+            screen.blit(title, (12, display_size[1] + 12))
+            screen.blit(help_line, (12, display_size[1] + 45))
+            screen.blit(source_line, (12, display_size[1] + 74))
+            if notice:
+                notice_line = help_font.render(notice, True, (255, 170, 120))
+                screen.blit(notice_line, (12, display_size[1] + 94))
             pygame.display.flip()
             clock.tick(60)
     except pygame.error as exc:
-        raise RuntimeError(f"failed to open goal-frame selector: {exc}") from exc
+        raise RuntimeError(f"failed to open frame selector: {exc}") from exc
     finally:
-        capture.release()
         if pygame_initialized:
             pygame.quit()
+
+
+def select_goal_video_frame(video_path: Path) -> int | None:
+    """Show a small keyboard UI and return the confirmed zero-based frame.
+
+    This function is called before planner, camera, or robot initialization.
+    Returning ``None`` means the operator cancelled safely.
+    """
+    path = video_path.expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"goal video does not exist: {path}")
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("interactive goal selection requires OpenCV") from exc
+
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        capture.release()
+        raise ValueError(f"failed to open goal video: {path}")
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    if frame_count < 1:
+        capture.release()
+        raise ValueError(f"goal video contains no seekable frames: {path}")
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    if not np.isfinite(fps) or fps <= 0.0:
+        fps = 0.0
+
+    def read_frame(frame_index: int) -> np.ndarray:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, bgr = capture.read()
+        if not ok or bgr is None:
+            raise ValueError(f"failed to decode frame {frame_index} from {path}")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    try:
+        selected = _select_frame_indices(
+            frame_count=frame_count,
+            read_frame=read_frame,
+            source_label=str(path),
+            selection_labels=("goal",),
+            fps=fps,
+        )
+        return None if selected is None else selected[0]
+    finally:
+        capture.release()
+
+
+@dataclass(frozen=True)
+class DatasetFramePair:
+    initial_frame: np.ndarray
+    goal_frame: np.ndarray
+    initial_xy: np.ndarray
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ResolvedDatasetEpisode:
+    """One merged-HDF5 episode resolved from an ID or source-video path."""
+
+    episode_id: int
+    requested: str
+    video_path: Path | None = None
+    session_id: str | None = None
+    local_episode_id: int | None = None
+
+    def provenance(self) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "requested": self.requested,
+            "merged_episode_id": self.episode_id,
+            "kind": "video_path" if self.video_path is not None else "global_id",
+        }
+        if self.video_path is not None:
+            metadata.update(
+                {
+                    "video_path": str(self.video_path),
+                    "session_id": self.session_id,
+                    "local_episode_id": self.local_episode_id,
+                }
+            )
+        return metadata
+
+
+_EPISODE_VIDEO_RE = re.compile(r"ep_(\d+)\.mp4", re.IGNORECASE)
+_SESSION_ID_RE = re.compile(r"(\d{8}_\d{6})$")
+
+
+def _source_session_ids(dataset: Any) -> list[str]:
+    """Read ordered collection-session IDs from a merged dataset."""
+    raw_sources = dataset.attrs.get("source_files_json")
+    if raw_sources is None:
+        raise ValueError(
+            "dataset has no source_files_json metadata; use the global integer "
+            "episode ID instead"
+        )
+    if isinstance(raw_sources, bytes):
+        raw_sources = raw_sources.decode("utf-8")
+    try:
+        source_files = json.loads(str(raw_sources))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("dataset source_files_json metadata is invalid") from exc
+    if not isinstance(source_files, list) or not source_files:
+        raise ValueError("dataset source_files_json must be a non-empty list")
+
+    session_ids: list[str] = []
+    for source in source_files:
+        match = _SESSION_ID_RE.search(Path(str(source)).stem)
+        if match is None:
+            raise ValueError(f"cannot extract a session timestamp from source {source!r}")
+        session_ids.append(match.group(1))
+    if len(set(session_ids)) != len(session_ids):
+        raise ValueError("dataset source_files_json contains duplicate session timestamps")
+    return session_ids
+
+
+def _session_video_episode_ids(session_dir: Path) -> list[int]:
+    """Return and validate the local ep_NNN IDs in one video directory."""
+    if not session_dir.is_dir():
+        raise ValueError(
+            f"dataset video session directory does not exist: {session_dir}"
+        )
+    episode_ids = sorted(
+        int(match.group(1))
+        for path in session_dir.iterdir()
+        if path.is_file() and (match := _EPISODE_VIDEO_RE.fullmatch(path.name))
+    )
+    if not episode_ids:
+        raise ValueError(f"no ep_NNN.mp4 files found in {session_dir}")
+    if episode_ids != list(range(len(episode_ids))):
+        raise ValueError(
+            f"video episodes in {session_dir} must be contiguous from ep_000"
+        )
+    return episode_ids
+
+
+def resolve_dataset_episode(
+    dataset_path: Path,
+    requested: int | str | Path,
+    *,
+    repo_root: Path,
+) -> ResolvedDatasetEpisode:
+    """Resolve a global ID or datasets_videos/SESSION/ep_NNN.mp4 reference.
+
+    The merged PushBox dataset concatenates source HDF5 files in the order saved
+    in source_files_json and renumbers their local episodes globally. The
+    corresponding video directories retain those local ep_NNN names. We
+    validate the complete video inventory against the merged episode count
+    before using that ordering to translate a readable video path.
+    """
+    text = str(requested).strip()
+    try:
+        episode_id = int(text)
+    except ValueError:
+        episode_id = None
+    if episode_id is not None:
+        if episode_id < 0:
+            raise ValueError("--dataset-episode must be non-negative")
+        return ResolvedDatasetEpisode(episode_id=episode_id, requested=text)
+
+    video_path = Path(text).expanduser()
+    if not video_path.is_absolute():
+        video_path = repo_root / video_path
+    video_path = video_path.resolve()
+    if not video_path.is_file():
+        raise ValueError(f"dataset episode video does not exist: {video_path}")
+    video_match = _EPISODE_VIDEO_RE.fullmatch(video_path.name)
+    if video_match is None:
+        raise ValueError(
+            "--dataset-episode video must be named ep_NNN.mp4, got "
+            f"{video_path.name!r}"
+        )
+    local_episode_id = int(video_match.group(1))
+    session_id = video_path.parent.name
+    if _SESSION_ID_RE.fullmatch(session_id) is None:
+        raise ValueError(
+            "--dataset-episode video parent directory must be a session timestamp "
+            f"like 20260715_180541, got {session_id!r}"
+        )
+
+    try:
+        import h5py
+    except ImportError as exc:
+        raise RuntimeError("dataset episode resolution requires h5py") from exc
+
+    dataset_path = dataset_path.expanduser().resolve()
+    if not dataset_path.is_file():
+        raise ValueError(f"dataset does not exist: {dataset_path}")
+    with h5py.File(dataset_path, "r") as dataset:
+        if "episode_idx" not in dataset:
+            raise ValueError("dataset is missing required column: episode_idx")
+        source_sessions = _source_session_ids(dataset)
+        merged_episode_ids = np.unique(
+            np.asarray(dataset["episode_idx"], dtype=np.int64)
+        )
+
+    if session_id not in source_sessions:
+        raise ValueError(
+            f"video session {session_id} is not listed in the dataset sources"
+        )
+    videos_root = video_path.parent.parent
+    source_counts = [
+        len(_session_video_episode_ids(videos_root / source_session))
+        for source_session in source_sessions
+    ]
+    expected_merged_ids = np.arange(sum(source_counts), dtype=np.int64)
+    if not np.array_equal(merged_episode_ids, expected_merged_ids):
+        raise ValueError(
+            "dataset video inventory does not match the merged HDF5 episode IDs; "
+            "use the global integer episode ID instead"
+        )
+
+    source_index = source_sessions.index(session_id)
+    if local_episode_id >= source_counts[source_index]:
+        raise ValueError(
+            f"session {session_id} has {source_counts[source_index]} episodes; "
+            f"requested ep_{local_episode_id:03d}"
+        )
+    merged_episode_id = sum(source_counts[:source_index]) + local_episode_id
+    return ResolvedDatasetEpisode(
+        episode_id=merged_episode_id,
+        requested=text,
+        video_path=video_path,
+        session_id=session_id,
+        local_episode_id=local_episode_id,
+    )
+
+
+def _dataset_episode_rows(dataset: Any, episode_id: int) -> np.ndarray:
+    required = {"episode_idx", "step_idx", "pixels", "state"}
+    missing = sorted(required.difference(dataset.keys()))
+    if missing:
+        raise ValueError(f"dataset is missing required columns: {', '.join(missing)}")
+    episode_ids = np.asarray(dataset["episode_idx"])
+    rows = np.flatnonzero(episode_ids == int(episode_id))
+    if rows.size == 0:
+        available = np.unique(episode_ids)
+        summary = (
+            f"{int(available.min())}..{int(available.max())}"
+            if available.size
+            else "none"
+        )
+        raise ValueError(
+            f"dataset episode {episode_id} does not exist; available IDs: {summary}"
+        )
+    if not np.array_equal(rows, np.arange(rows[0], rows[-1] + 1)):
+        raise ValueError(f"dataset episode {episode_id} rows are not contiguous")
+    steps = np.asarray(dataset["step_idx"][rows], dtype=np.int64)
+    if not np.array_equal(steps, np.arange(rows.size, dtype=np.int64)):
+        raise ValueError(
+            f"dataset episode {episode_id} must have contiguous zero-based step_idx"
+        )
+    return rows
+
+
+def select_dataset_frame_pair(
+    dataset_path: Path, episode_id: int
+) -> tuple[int, int] | None:
+    """Interactively select initial and later goal steps from one HDF5 episode."""
+    try:
+        import h5py
+    except ImportError as exc:
+        raise RuntimeError("dataset frame selection requires h5py") from exc
+
+    path = dataset_path.expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"dataset does not exist: {path}")
+    with h5py.File(path, "r") as dataset:
+        rows = _dataset_episode_rows(dataset, episode_id)
+
+        def read_frame(frame_index: int) -> np.ndarray:
+            return np.asarray(dataset["pixels"][int(rows[frame_index])])
+
+        selected = _select_frame_indices(
+            frame_count=int(rows.size),
+            read_frame=read_frame,
+            source_label=f"{path.name} | episode {episode_id}",
+            selection_labels=("initial", "goal"),
+            fps=5.0,
+            require_increasing=True,
+        )
+    return None if selected is None else (selected[0], selected[1])
+
+
+def load_dataset_frame_pair(
+    dataset_path: Path,
+    *,
+    episode_id: int,
+    initial_step: int,
+    goal_step: int,
+) -> DatasetFramePair:
+    """Load aligned start/goal images and the saved initial end-effector XY."""
+    try:
+        import h5py
+    except ImportError as exc:
+        raise RuntimeError("dataset frame loading requires h5py") from exc
+
+    path = dataset_path.expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"dataset does not exist: {path}")
+    if initial_step < 0 or goal_step < 0:
+        raise ValueError("dataset initial/goal steps must be non-negative")
+    if initial_step >= goal_step:
+        raise ValueError("dataset goal step must be later than the initial step")
+
+    with h5py.File(path, "r") as dataset:
+        rows = _dataset_episode_rows(dataset, episode_id)
+        if goal_step >= rows.size:
+            raise ValueError(
+                f"dataset episode {episode_id} has {rows.size} steps; "
+                f"requested goal step {goal_step}"
+            )
+        initial_row = int(rows[initial_step])
+        goal_row = int(rows[goal_step])
+        initial_frame = np.asarray(dataset["pixels"][initial_row])
+        goal_frame = np.asarray(dataset["pixels"][goal_row])
+        initial_state = np.asarray(dataset["state"][initial_row], dtype=np.float64)
+
+    for label, frame in (("initial", initial_frame), ("goal", goal_frame)):
+        if frame.shape != MODEL_IMAGE_SHAPE or frame.dtype != np.uint8:
+            raise ValueError(
+                f"dataset {label} frame must be RGB uint8 {MODEL_IMAGE_SHAPE}, "
+                f"got {frame.shape} {frame.dtype}"
+            )
+    if initial_state.size < 2 or not np.isfinite(initial_state[:2]).all():
+        raise ValueError("dataset initial state does not contain finite end-effector XY")
+    initial_xy = initial_state[:2].copy()
+    metadata = {
+        "kind": "dataset_episode",
+        "path": str(path),
+        "episode_id": int(episode_id),
+        "initial_step": int(initial_step),
+        "goal_step": int(goal_step),
+        "initial_row": initial_row,
+        "goal_row": goal_row,
+        "initial_xy": initial_xy.tolist(),
+    }
+    return DatasetFramePair(
+        initial_frame=initial_frame.copy(),
+        goal_frame=goal_frame.copy(),
+        initial_xy=initial_xy,
+        metadata=metadata,
+    )
 
 
 def load_external_goal(
@@ -516,12 +890,27 @@ def prioritize_ui_events(events: UIEvents) -> tuple[str, str | None] | None:
 
 
 class RealRobotUI:
-    """Pygame adapter; current and goal frames are shown side by side."""
+    """Pygame adapter for current, optional dataset-start, and goal frames."""
 
-    def __init__(self, held_input: Any, size: int = 224, ui_fps: int = 30) -> None:
+    def __init__(
+        self,
+        held_input: Any,
+        size: int = 224,
+        ui_fps: int = 30,
+        initial_reference: np.ndarray | None = None,
+    ) -> None:
         self.held_input = held_input
         self.size = int(size)
         self.ui_fps = int(ui_fps)
+        if initial_reference is not None:
+            reference = np.asarray(initial_reference)
+            if reference.shape != (self.size, self.size, 3) or reference.dtype != np.uint8:
+                raise ValueError(
+                    "initial UI reference must be RGB uint8 with the configured display size"
+                )
+            self.initial_reference = reference.copy()
+        else:
+            self.initial_reference = None
         self._pygame: Any = None
         self._screen: Any = None
         self._font: Any = None
@@ -533,7 +922,10 @@ class RealRobotUI:
 
         pygame.init()
         self._pygame = pygame
-        self._screen = pygame.display.set_mode((self.size * 2, self.size + 64))
+        panel_count = 3 if self.initial_reference is not None else 2
+        self._screen = pygame.display.set_mode(
+            (self.size * panel_count, self.size + 64)
+        )
         pygame.display.set_caption("LeWM real PushBox evaluation")
         self._font = pygame.font.Font(None, 22)
         self._focused = bool(pygame.key.get_focused())
@@ -624,6 +1016,15 @@ class RealRobotUI:
             "RGB",
         )
         self._screen.blit(current_surface, (0, 0))
+        goal_x = self.size
+        if self.initial_reference is not None:
+            initial_surface = pygame.image.frombuffer(
+                np.ascontiguousarray(self.initial_reference).tobytes(),
+                (self.size, self.size),
+                "RGB",
+            )
+            self._screen.blit(initial_surface, (self.size, 0))
+            goal_x = self.size * 2
         if goal is None:
             goal_surface = pygame.Surface((self.size, self.size))
             goal_surface.fill((20, 20, 20))
@@ -633,13 +1034,19 @@ class RealRobotUI:
                 (self.size, self.size),
                 "RGB",
             )
-        self._screen.blit(goal_surface, (self.size, 0))
-        overlay = pygame.Surface((self.size * 2, 64), pygame.SRCALPHA)
+        self._screen.blit(goal_surface, (goal_x, 0))
+        panel_count = 3 if self.initial_reference is not None else 2
+        overlay = pygame.Surface((self.size * panel_count, 64), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 230))
         overlay.blit(self._font.render("CURRENT", True, (255, 255, 255)), (8, 4))
+        if self.initial_reference is not None:
+            overlay.blit(
+                self._font.render("DATASET START", True, (255, 255, 255)),
+                (self.size + 8, 4),
+            )
         overlay.blit(
             self._font.render("GOAL", True, (255, 255, 255)),
-            (self.size + 8, 4),
+            (goal_x + 8, 4),
         )
         overlay.blit(self._font.render(status, True, (220, 255, 220)), (8, 30))
         self._screen.blit(overlay, (0, self.size))
@@ -818,10 +1225,29 @@ def _build_parser(repo_root: Path) -> argparse.ArgumentParser:
             "selector unless --goal-video-frame is supplied"
         ),
     )
+    goal_source.add_argument(
+        "--dataset-episode",
+        metavar="ID_OR_VIDEO",
+        help=(
+            "select aligned initial and goal frames from a global episode ID or "
+            "a datasets_videos/SESSION/ep_NNN.mp4 path; the saved initial "
+            "end-effector XY replaces --start-x/y"
+        ),
+    )
     parser.add_argument(
         "--goal-video-frame",
         type=int,
         help="zero-based frame within --goal-video; bypasses the selector",
+    )
+    parser.add_argument(
+        "--initial-step",
+        type=int,
+        help="zero-based initial step within --dataset-episode",
+    )
+    parser.add_argument(
+        "--goal-step",
+        type=int,
+        help="zero-based goal step within --dataset-episode",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--follower-ip", default="192.168.1.3")
@@ -1065,6 +1491,69 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             if args.goal_video.is_absolute()
             else repo_root / args.goal_video.expanduser()
         ).resolve()
+    elif args.goal_video_frame is not None:
+        parser.error("--goal-video-frame requires --goal-video")
+    dataset_pair: DatasetFramePair | None = None
+    resolved_dataset_episode: ResolvedDatasetEpisode | None = None
+    if args.dataset_episode is None:
+        if args.initial_step is not None or args.goal_step is not None:
+            parser.error("--initial-step/--goal-step require --dataset-episode")
+    else:
+        try:
+            resolved_dataset_episode = resolve_dataset_episode(
+                args.dataset,
+                args.dataset_episode,
+                repo_root=repo_root,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            parser.error(str(exc))
+        args.dataset_episode = resolved_dataset_episode.episode_id
+        if resolved_dataset_episode.video_path is not None:
+            print(
+                f"Resolved {resolved_dataset_episode.video_path} to merged dataset "
+                f"episode {args.dataset_episode}."
+            )
+        if (args.initial_step is None) != (args.goal_step is None):
+            parser.error(
+                "provide both --initial-step and --goal-step, or omit both "
+                "for interactive selection"
+            )
+        if args.initial_step is None:
+            if args.preflight:
+                parser.error(
+                    "--preflight with --dataset-episode requires --initial-step "
+                    "and --goal-step because preflight never opens a display"
+                )
+            try:
+                selected_pair = select_dataset_frame_pair(
+                    args.dataset, args.dataset_episode
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                parser.error(str(exc))
+            if selected_pair is None:
+                print(
+                    "Dataset frame selection cancelled; planner, camera, and "
+                    "robot were not started."
+                )
+                return 0
+            args.initial_step, args.goal_step = selected_pair
+            print(
+                f"Selected dataset episode {args.dataset_episode}: "
+                f"initial step {args.initial_step}, goal step {args.goal_step}."
+            )
+        try:
+            dataset_pair = load_dataset_frame_pair(
+                args.dataset,
+                episode_id=args.dataset_episode,
+                initial_step=args.initial_step,
+                goal_step=args.goal_step,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            parser.error(str(exc))
+        dataset_pair.metadata["episode_reference"] = (
+            resolved_dataset_episode.provenance()
+        )
+        args.start_x, args.start_y = dataset_pair.initial_xy.tolist()
     if args.goal_video is not None and args.goal_video_frame is None:
         if args.preflight:
             parser.error(
@@ -1154,16 +1643,27 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         if artifact_manifest is not None
         else 192
     )
-    try:
-        external_goal, external_goal_source = load_external_goal(
-            goal_image=args.goal_image,
-            goal_video=args.goal_video,
-            goal_video_frame=args.goal_video_frame,
-            transform_profile=config.transform_profile,
+    external_initial: np.ndarray | None = None
+    if dataset_pair is not None:
+        external_initial = dataset_pair.initial_frame
+        external_goal = dataset_pair.goal_frame
+        external_goal_source = dataset_pair.metadata
+        print(
+            f"Loaded dataset episode {args.dataset_episode}: initial step "
+            f"{args.initial_step} at EE XY {dataset_pair.initial_xy.tolist()}, "
+            f"goal step {args.goal_step}."
         )
-    except ValueError as exc:
-        parser.error(str(exc))
-    if external_goal_source is not None:
+    else:
+        try:
+            external_goal, external_goal_source = load_external_goal(
+                goal_image=args.goal_image,
+                goal_video=args.goal_video,
+                goal_video_frame=args.goal_video_frame,
+                transform_profile=config.transform_profile,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    if external_goal_source is not None and dataset_pair is None:
         print(
             "Loaded external goal: "
             f"{external_goal_source['path']}"
@@ -1176,6 +1676,13 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     mode_name = "EXECUTE" if args.execute else "DRY RUN"
     print(f"Starting real PushBox evaluation in {mode_name} mode")
+    print(
+        "Planner configuration: "
+        f"action_mode={args.action_mode}, horizon={args.horizon}, "
+        f"samples={args.num_samples}, iterations={args.iterations}, "
+        f"elites={args.elite_count}, action_cap={args.action_cap:g} m, "
+        f"max_actions={args.max_actions}"
+    )
     if args.negate_planner_action:
         print(
             "WARNING: NEGATED PLANNER-ACTION DIAGNOSTIC is enabled. "
@@ -1204,7 +1711,9 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     image_store = LatestImageStore()
     ros = RosImageSubscriber(image_store)
-    ui = RealRobotUI(HeldInput(config.magnitudes))
+    ui = RealRobotUI(
+        HeldInput(config.magnitudes), initial_reference=external_initial
+    )
     arm: Any = None
     recorder: RunRecorder | None = None
     home_positions = np.array(
@@ -1284,7 +1793,16 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 or np.linalg.norm(startup_velocity[:3]) > args.settled_linear_speed
             ):
                 raise RuntimeError("arm did not settle after the startup trajectory")
-            recorder.event("startup_pose_verified", pose=startup_pose)
+            recorder.event(
+                "startup_pose_verified",
+                pose=startup_pose,
+                target_xy=target_xy,
+                target_source=(
+                    "dataset_initial_state"
+                    if dataset_pair is not None
+                    else "configured_start"
+                ),
+            )
 
         print(
             "Controls: arrows=manual, 1/2/3=speed, g=capture goal, v=preview, "
@@ -1331,18 +1849,33 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         pending_settle_to_capture_s: float | None = None
 
         if goal is not None:
+            initial_reference_path = (
+                None
+                if external_initial is None
+                else recorder.save_frame(
+                    f"trial_{trial_id:03d}_dataset_initial", external_initial
+                )
+            )
             goal_path = recorder.save_frame(f"trial_{trial_id:03d}_goal", goal)
             recorder.event(
                 "trial_started",
                 trial_id=trial_id,
                 goal_frame=goal_path,
+                initial_reference_frame=initial_reference_path,
                 goal_source=external_goal_source,
                 camera_sequence=None,
             )
-            print(
-                "external goal ready. Arrange the current scene, then press v "
-                "for a preview or p to arm autonomous execution."
-            )
+            if external_initial is not None:
+                print(
+                    "dataset start and goal ready. The startup target is the saved "
+                    "initial XY; manually match the box to DATASET START, then press v for "
+                    "a preview or p to arm autonomous execution."
+                )
+            else:
+                print(
+                    "external goal ready. Arrange the current scene, then press v "
+                    "for a preview or p to arm autonomous execution."
+                )
 
         def mark_motion_pending(command_ns: int | None = None) -> None:
             nonlocal tracking_check_after, motion_settle_deadline
