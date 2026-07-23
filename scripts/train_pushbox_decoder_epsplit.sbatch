@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --account=torch_pr_519_general
 #SBATCH --job-name=lewm-pushbox-decoder-epsplit
-#SBATCH --partition=h200_tandon,h200_public
 #SBATCH --gres=gpu:h200:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
