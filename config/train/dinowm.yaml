@@ -13,11 +13,20 @@ seed: 3072
 
 # PushBox was recorded at 5 Hz. The nominal 4 h curve consumes every training
 # episode remaining after the common held-out validation split (~3.7 h actual).
+#
+# Set curve.train_fraction to size the subset relative to the available
+# training split instead (0.25/0.5/0.75/1.0); it takes precedence over
+# train_hours. Both selectors share subset_seed, so subsets stay nested and
+# match the LeWM runs episode for episode.
 curve:
   label: 4h
   train_hours: 4.0
+  train_fraction: null
   sample_hz: 5.0
   subset_seed: 8317
+  # Give every fraction the same optimizer-step budget as the full split, so
+  # the curve measures data volume rather than truncated training.
+  match_optimizer_steps: false
 
 dataset_name: ${oc.env:PUSHBOX_DATASET,pushbox_pilot_train.h5}
 n_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
@@ -84,8 +93,10 @@ trainer:
   log_every_n_steps: 20
 
 wandb:
-  # Keep experiment data local unless W&B is explicitly enabled by the user.
-  enabled: false
+  # Log to W&B so DINO-WM runs are comparable with the LeWM arms, which have
+  # always logged there. The local CSV log is written either way, so disabling
+  # this loses the W&B run but never the on-disk metrics.
+  enabled: true
   config:
     entity: cw5167-nyu
     project: le-wm

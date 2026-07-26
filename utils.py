@@ -92,6 +92,41 @@ def balanced_episode_split(dataset, train_fraction, seed, search_trials=50_000):
     )
 
 
+def matched_step_epochs(base_epochs, subset_clips, full_clips, batch_size):
+    """Epochs giving a subset the same optimizer-step budget as the full split.
+
+    A data-scaling curve trained for a fixed number of epochs confounds two
+    variables: the small budgets see less data *and* take proportionally fewer
+    optimizer steps, so they are undertrained rather than data-limited. Holding
+    steps constant isolates the effect of data volume. Checkpoints are still
+    written every interval, so an overfitting subset can be read off the
+    validation curve instead of being hidden by an early stop.
+    """
+    for name, value in (
+        ("base_epochs", base_epochs),
+        ("subset_clips", subset_clips),
+        ("full_clips", full_clips),
+        ("batch_size", batch_size),
+    ):
+        if value < 1:
+            raise ValueError(f"{name} must be positive, got {value}")
+    if subset_clips > full_clips:
+        raise ValueError(
+            f"subset_clips ({subset_clips}) exceeds full_clips ({full_clips})"
+        )
+
+    # drop_last=True on the training loader, so a partial batch is not a step.
+    subset_steps_per_epoch = subset_clips // batch_size
+    full_steps_per_epoch = full_clips // batch_size
+    if subset_steps_per_epoch < 1:
+        raise ValueError(
+            f"subset has {subset_clips} clips, fewer than one batch of "
+            f"{batch_size}"
+        )
+    target_steps = int(base_epochs) * full_steps_per_epoch
+    return -(-target_steps // subset_steps_per_epoch)  # ceil division
+
+
 def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     imagenet_stats = dt.dataset_stats.ImageNet
     to_image = dt.transforms.ToImage(**imagenet_stats, source=source, target=target)
@@ -111,8 +146,13 @@ class ZScoreNormalizer:
         return ((x - self.mean) / self.std).float()
 
 
-def get_column_normalizer(dataset, source: str, target: str, episode_indices=None):
-    """Get normalizer for a specific column in the dataset."""
+def column_zscore_stats(dataset, source: str, episode_indices=None):
+    """Mean/std/row-count for one column, restricted to selected episodes.
+
+    Exposed separately from :func:`get_column_normalizer` so a run can record
+    the exact statistics it trained with; deploying a checkpoint on the robot
+    requires reproducing them.
+    """
     col_data = dataset.get_col_data(source)
     if episode_indices is not None:
         row_indices = np.concatenate(
@@ -129,6 +169,12 @@ def get_column_normalizer(dataset, source: str, target: str, episode_indices=Non
     data = data[~torch.isnan(data).any(dim=1)]
     mean = data.mean(0, keepdim=True).clone()
     std = data.std(0, keepdim=True).clone()
+    return mean, std, int(data.shape[0])
+
+
+def get_column_normalizer(dataset, source: str, target: str, episode_indices=None):
+    """Get normalizer for a specific column in the dataset."""
+    mean, std, _ = column_zscore_stats(dataset, source, episode_indices)
     return dt.transforms.WrapTorchTransform(
         ZScoreNormalizer(mean, std), source=source, target=target
     )

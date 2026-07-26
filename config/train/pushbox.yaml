@@ -39,6 +39,16 @@ optimizer:
 
 num_preds: 1
 
+# Data-scaling sweep. train_fraction=null trains on the whole training split
+# (the default, unchanged). Setting it to 0.25/0.5/0.75/1.0 selects a nested
+# subset using the same selector, seed, and episode split as train_dinowm.py,
+# so each fraction holds identical episodes across both architectures.
+curve:
+  train_fraction: null
+  sample_hz: 5.0
+  subset_seed: 8317
+  match_optimizer_steps: false
+
 loss:
   sigreg:
     weight: 0.09

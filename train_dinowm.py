@@ -17,12 +17,17 @@ import torch.nn.functional as F
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from omegaconf import OmegaConf, open_dict
 
-from dinowm_utils import compute_column_stats, select_nested_episode_subset
+from dinowm_utils import (
+    compute_column_stats,
+    select_episode_fraction,
+    select_nested_episode_subset,
+)
 from utils import (
     SaveCkptCallback,
     ZScoreNormalizer,
     balanced_episode_split,
     get_img_preprocessor,
+    matched_step_epochs,
 )
 
 
@@ -156,13 +161,23 @@ def run(cfg):
         seed=cfg.seed,
         search_trials=cfg.split_search_trials,
     )
-    train_subset = select_nested_episode_subset(
-        dataset,
-        episode_split.train_episode_indices,
-        target_hours=cfg.curve.train_hours,
-        sample_hz=cfg.curve.sample_hz,
-        seed=cfg.curve.subset_seed,
-    )
+    train_fraction = cfg.curve.get("train_fraction")
+    if train_fraction is not None:
+        train_subset = select_episode_fraction(
+            dataset,
+            episode_split.train_episode_indices,
+            fraction=float(train_fraction),
+            sample_hz=cfg.curve.sample_hz,
+            seed=cfg.curve.subset_seed,
+        )
+    else:
+        train_subset = select_nested_episode_subset(
+            dataset,
+            episode_split.train_episode_indices,
+            target_hours=cfg.curve.train_hours,
+            sample_hz=cfg.curve.sample_hz,
+            seed=cfg.curve.subset_seed,
+        )
     if len(train_subset.clip_indices) < cfg.batch_size:
         raise ValueError(
             f"Training subset has only {len(train_subset.clip_indices)} clips"
@@ -181,10 +196,25 @@ def run(cfg):
     validation_frames = int(
         np.asarray(dataset.lengths)[episode_split.val_episode_indices].sum()
     )
+    max_epochs = int(cfg.trainer.max_epochs)
+    if cfg.curve.get("match_optimizer_steps", False):
+        max_epochs = matched_step_epochs(
+            base_epochs=cfg.trainer.max_epochs,
+            subset_clips=len(train_subset.clip_indices),
+            full_clips=len(episode_split.train_clip_indices),
+            batch_size=cfg.batch_size,
+        )
+        print(
+            f"Matching optimizer steps: {cfg.trainer.max_epochs} epochs on the "
+            f"full split -> {max_epochs} epochs on this subset"
+        )
     manifest = {
         "dataset": str(cfg.dataset_name),
         "sample_hz": float(cfg.curve.sample_hz),
         "nominal_train_hours": float(cfg.curve.train_hours),
+        "train_fraction": (
+            None if train_fraction is None else float(train_fraction)
+        ),
         "actual_train_hours": train_subset.hours,
         "train_frames": train_subset.num_frames,
         "train_clips": int(len(train_subset.clip_indices)),
@@ -197,11 +227,23 @@ def run(cfg):
         "validation_episode_indices": episode_split.val_episode_indices.tolist(),
         "split_seed": int(cfg.seed),
         "subset_seed": int(cfg.curve.subset_seed),
+        "base_max_epochs": int(cfg.trainer.max_epochs),
+        "max_epochs": max_epochs,
+        "match_optimizer_steps": bool(
+            cfg.curve.get("match_optimizer_steps", False)
+        ),
+        "optimizer_steps": max_epochs
+        * (len(train_subset.clip_indices) // cfg.batch_size),
         "normalization": normalization,
     }
+    budget = (
+        f"fraction={float(train_fraction):.4g}"
+        if train_fraction is not None
+        else f"nominal={cfg.curve.train_hours:g}h"
+    )
     print(
         "DINO-WM curve: "
-        f"label={cfg.curve.label}, nominal={cfg.curve.train_hours:g}h, "
+        f"label={cfg.curve.label}, {budget}, "
         f"actual_train={train_subset.hours:.3f}h/"
         f"{len(train_subset.episode_indices)} episodes/"
         f"{len(train_subset.clip_indices)} clips, "
@@ -308,12 +350,15 @@ def run(cfg):
     _write_metadata(model_dir, cfg, manifest)
     _write_metadata(run_dir, cfg, manifest)
 
-    logger = None
+    # The local CSV log is always written, and W&B is attached alongside it when
+    # enabled rather than replacing it. Previously these were exclusive, so
+    # turning on W&B silently dropped the on-disk metrics that make a run
+    # recoverable when the upload is unavailable.
+    logger = [CSVLogger(save_dir=str(run_dir / "logs"), name="csv")]
     if cfg.wandb.enabled:
-        logger = WandbLogger(**cfg.wandb.config)
-        logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
-    else:
-        logger = CSVLogger(save_dir=str(run_dir / "logs"), name="csv")
+        wandb_logger = WandbLogger(**cfg.wandb.config)
+        wandb_logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
+        logger.insert(0, wandb_logger)
 
     module = spt.Module(
         model=world_model,
@@ -326,6 +371,7 @@ def run(cfg):
         },
     )
     trainer_cfg = OmegaConf.to_container(cfg.trainer, resolve=True)
+    trainer_cfg["max_epochs"] = max_epochs
     trainer_cfg.setdefault("default_root_dir", str(run_dir))
     trainer = pl.Trainer(
         **trainer_cfg,

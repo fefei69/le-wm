@@ -49,6 +49,13 @@ optimizer:
 
 num_preds: 1
 
+# See config/train/pushbox.yaml for the data-scaling sweep contract.
+curve:
+  train_fraction: null
+  sample_hz: 5.0
+  subset_seed: 8317
+  match_optimizer_steps: false
+
 loss:
   sigreg:
     weight: 0.09

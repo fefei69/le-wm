@@ -41,6 +41,48 @@ def episode_clip_indices(dataset, episode_indices) -> np.ndarray:
     )
 
 
+def _nested_prefix(
+    dataset,
+    candidate_episode_indices,
+    target_frames: float,
+    sample_hz: float,
+    seed: int,
+) -> EpisodeSubset:
+    """Select the deterministic shuffled-prefix closest to ``target_frames``.
+
+    Episodes stay atomic and the shuffle depends only on ``seed``, so a larger
+    ``target_frames`` always yields a superset of a smaller one.
+    """
+
+    candidates = np.unique(
+        np.asarray(candidate_episode_indices, dtype=np.int64)
+    )
+    if candidates.size == 0:
+        raise ValueError("candidate_episode_indices cannot be empty")
+    if candidates.min() < 0 or candidates.max() >= len(dataset.lengths):
+        raise IndexError("candidate episode index is outside dataset.lengths")
+
+    ordered = np.random.default_rng(seed).permutation(candidates)
+    ordered_lengths = np.asarray(dataset.lengths, dtype=np.int64)[ordered]
+    cumulative_frames = np.cumsum(ordered_lengths)
+
+    if target_frames >= cumulative_frames[-1]:
+        count = len(ordered)
+    else:
+        # The closest prefix is deterministic and remains monotonic as the
+        # requested duration increases.
+        count = int(np.argmin(np.abs(cumulative_frames - target_frames))) + 1
+
+    selected = np.sort(ordered[:count])
+    num_frames = int(np.asarray(dataset.lengths)[selected].sum())
+    return EpisodeSubset(
+        episode_indices=selected,
+        clip_indices=episode_clip_indices(dataset, selected),
+        num_frames=num_frames,
+        hours=num_frames / float(sample_hz) / 3600.0,
+    )
+
+
 def select_nested_episode_subset(
     dataset,
     candidate_episode_indices,
@@ -62,33 +104,50 @@ def select_nested_episode_subset(
     if sample_hz <= 0:
         raise ValueError(f"sample_hz must be positive, got {sample_hz}")
 
+    return _nested_prefix(
+        dataset,
+        candidate_episode_indices,
+        target_frames=float(target_hours) * 3600.0 * float(sample_hz),
+        sample_hz=sample_hz,
+        seed=seed,
+    )
+
+
+def select_episode_fraction(
+    dataset,
+    candidate_episode_indices,
+    fraction: float,
+    sample_hz: float,
+    seed: int,
+) -> EpisodeSubset:
+    """Select a nested subset holding ``fraction`` of the candidate frames.
+
+    This is the duration-targeted selection expressed relative to whatever is
+    available, so 1.0 always means "every training episode" without needing to
+    know the recording length in advance. Sharing ``seed`` and ``candidates``
+    across fractions keeps the subsets nested and keeps them identical across
+    model architectures, which is what makes a data-scaling comparison fair.
+    """
+
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+    if sample_hz <= 0:
+        raise ValueError(f"sample_hz must be positive, got {sample_hz}")
+
     candidates = np.unique(
         np.asarray(candidate_episode_indices, dtype=np.int64)
     )
     if candidates.size == 0:
         raise ValueError("candidate_episode_indices cannot be empty")
-    if candidates.min() < 0 or candidates.max() >= len(dataset.lengths):
-        raise IndexError("candidate episode index is outside dataset.lengths")
-
-    ordered = np.random.default_rng(seed).permutation(candidates)
-    ordered_lengths = np.asarray(dataset.lengths, dtype=np.int64)[ordered]
-    cumulative_frames = np.cumsum(ordered_lengths)
-    target_frames = float(target_hours) * 3600.0 * float(sample_hz)
-
-    if target_frames >= cumulative_frames[-1]:
-        count = len(ordered)
-    else:
-        # The closest prefix is deterministic and remains monotonic as the
-        # requested duration increases.
-        count = int(np.argmin(np.abs(cumulative_frames - target_frames))) + 1
-
-    selected = np.sort(ordered[:count])
-    num_frames = int(np.asarray(dataset.lengths)[selected].sum())
-    return EpisodeSubset(
-        episode_indices=selected,
-        clip_indices=episode_clip_indices(dataset, selected),
-        num_frames=num_frames,
-        hours=num_frames / float(sample_hz) / 3600.0,
+    available_frames = float(
+        np.asarray(dataset.lengths, dtype=np.int64)[candidates].sum()
+    )
+    return _nested_prefix(
+        dataset,
+        candidates,
+        target_frames=float(fraction) * available_frames,
+        sample_hz=sample_hz,
+        seed=seed,
     )
 
 
