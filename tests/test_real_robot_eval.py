@@ -17,6 +17,7 @@ from real_robot_eval import (
     RunRecorder,
     UIEvents,
     _workspace_bounds,
+    build_robot_proprio,
     load_dataset_frame_pair,
     load_external_goal,
     motion_completion_status,
@@ -25,6 +26,7 @@ from real_robot_eval import (
     snapshot_follows_settle,
     transform_planner_action,
     validate_measured_pose,
+    validate_imagined_latent_rollout,
     validate_planned_action,
     validate_planner_result,
     validate_solver_diagnostics,
@@ -32,6 +34,7 @@ from real_robot_eval import (
 )
 from real_robot_planner import (
     CEMConfig,
+    DinoPushBoxPlanner,
     PushBoxPlanner,
     categorical_elite_update,
     clamp_action_norm,
@@ -39,6 +42,85 @@ from real_robot_planner import (
     quantize_actions,
     sample_categorical_indices,
 )
+
+
+class _TinyExtraEncoder(torch.nn.Module):
+    def __init__(self, in_chans: int, emb_dim: int = 1):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.patch_embed = torch.nn.Conv1d(
+            in_chans, emb_dim, kernel_size=1, bias=False
+        )
+        torch.nn.init.constant_(self.patch_embed.weight, 1.0)
+
+    def forward(self, values):
+        return self.patch_embed(values.permute(0, 2, 1)).permute(0, 2, 1)
+
+
+class _TinyDinoBackbone(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = argparse.Namespace(hidden_size=2)
+
+
+class _TinyDinoPredictor(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.num_frames = 3
+        self.num_patches = 4
+        self.pos_embedding = torch.nn.Parameter(torch.zeros(1, 12, 4))
+
+
+class _TinyDinoWorldModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = _TinyDinoBackbone()
+        self.predictor = _TinyDinoPredictor()
+        self.extra_encoders = torch.nn.ModuleDict(
+            {
+                "proprio": _TinyExtraEncoder(4),
+                "action": _TinyExtraEncoder(2),
+            }
+        )
+        self.history_size = 3
+        self.last_predict_input = None
+
+    def encode(
+        self,
+        info,
+        *,
+        emb_keys=None,
+        target="emb",
+        is_video=False,
+    ):
+        del is_video
+        pixels = info["pixels"]
+        batch, frames = pixels.shape[:2]
+        value = pixels.mean(dim=(2, 3, 4), keepdim=False)
+        pixel_embedding = torch.stack([value, value + 1.0], dim=-1)
+        pixel_embedding = pixel_embedding.unsqueeze(2).expand(
+            batch, frames, self.predictor.num_patches, 2
+        )
+        info["pixels_emb"] = pixel_embedding
+        keys = self.extra_encoders.keys() if emb_keys is None else emb_keys
+        embedding = pixel_embedding
+        for key in keys:
+            extra = self.extra_encoders[key](info[key])
+            info[f"{key}_emb"] = extra
+            tiled = extra.unsqueeze(2).expand(
+                batch, frames, self.predictor.num_patches, -1
+            )
+            embedding = torch.cat([embedding, tiled], dim=-1)
+        info[target] = embedding
+        return info
+
+    def predict(self, embedding):
+        self.last_predict_input = embedding.detach().clone()
+        prediction = embedding.clone()
+        prediction[..., :2] = (
+            embedding[..., :2] + embedding[..., 3:4]
+        )
+        return prediction
 
 
 class RealRobotSafetyTests(unittest.TestCase):
@@ -106,6 +188,96 @@ class RealRobotSafetyTests(unittest.TestCase):
             float(torch.linalg.vector_norm(projected, dim=-1).max()),
             ACTION_CAP_M,
         )
+
+    def test_robot_proprio_matches_collection_column_order(self):
+        proprio = build_robot_proprio(
+            [0.14, -0.03, 0.2, 0.0, 1.5, 0.0],
+            [0.01, -0.02, 0.03, 0.0, 0.0, 0.0],
+        )
+        np.testing.assert_allclose(proprio, [0.14, -0.03, 0.01, -0.02])
+        self.assertEqual(proprio.dtype, np.float32)
+        with self.assertRaisesRegex(ValueError, "finite"):
+            build_robot_proprio([np.nan, 0.0], [0.0, 0.0])
+
+    def test_dinowm_conditions_spatial_rollout_on_action_and_proprio(self):
+        planner = DinoPushBoxPlanner(
+            _TinyDinoWorldModel(),
+            action_mean=np.zeros(2, dtype=np.float32),
+            action_std=np.ones(2, dtype=np.float32),
+            proprio_mean=np.zeros(4, dtype=np.float32),
+            proprio_std=np.ones(4, dtype=np.float32),
+            config=CEMConfig(
+                horizon=1,
+                num_samples=2,
+                iterations=1,
+                elite_count=1,
+                action_cap_m=0.005,
+                action_mode="continuous",
+                evaluation_batch_size=1,
+            ),
+            device="cpu",
+        )
+        runtime = planner.describe()
+        self.assertEqual(runtime["world_model"], "dinowm")
+        self.assertEqual(runtime["latent_semantic_shape"], [4, 2])
+        self.assertEqual(runtime["latent_dim"], 8)
+
+        image = np.zeros((224, 224, 3), dtype=np.uint8)
+        proprio = np.array([0.14, -0.03, 0.01, -0.02], dtype=np.float32)
+        observation = planner._encode_observation(image, proprio)
+        # The four raw proprio values are summed by the tiny one-dimensional
+        # test encoder and tiled over every patch.
+        torch.testing.assert_close(
+            observation[0, 0, :, 2],
+            torch.full((4,), float(proprio.sum())),
+        )
+        planner._latent_context = observation
+        action = torch.tensor([[[0.002, -0.001]]], dtype=torch.float32)
+        rollout = planner._rollout_latents(observation, action)
+        self.assertEqual(tuple(rollout.shape), (1, 2, 4, 2))
+        # The planned action replaces the placeholder action attached to the
+        # current state before the causal predictor is called.
+        torch.testing.assert_close(
+            planner.model.last_predict_input[0, 0, :, 3],
+            torch.full((4,), 0.001),
+        )
+
+        transition = planner.predict_next_latent(action.numpy().reshape(2))
+        self.assertEqual(transition["encoded_latent"].shape, (8,))
+        self.assertEqual(transition["predicted_next_latent"].shape, (8,))
+        imagined = planner._selected_imagined_rollout(action[0])
+        self.assertEqual(imagined.shape, (1, 8))
+        self.assertEqual(imagined.dtype, np.float32)
+        self.assertTrue(np.isfinite(imagined).all())
+
+        planner.reset()
+        with self.assertRaisesRegex(ValueError, "current_proprio"):
+            planner.plan(image, np.full_like(image, 255))
+
+    def test_candidate_cost_batching_preserves_order(self):
+        planner = object.__new__(PushBoxPlanner)
+        planner.config = CEMConfig(
+            horizon=1,
+            num_samples=5,
+            iterations=1,
+            elite_count=1,
+            evaluation_batch_size=2,
+        )
+        batch_sizes = []
+
+        def cost(_latent, _goal, actions):
+            batch_sizes.append(actions.shape[0])
+            return actions[:, 0, 0]
+
+        planner._rollout_cost = cost
+        candidates = torch.arange(10, dtype=torch.float32).reshape(5, 1, 2)
+        costs = planner._evaluate_candidate_costs(
+            torch.zeros(1, 1, 1),
+            torch.zeros(1, 1, 1),
+            candidates,
+        )
+        self.assertEqual(batch_sizes, [2, 2, 1])
+        torch.testing.assert_close(costs, torch.tensor([0.0, 2.0, 4.0, 6.0, 8.0]))
 
     def test_cem_configuration_refuses_cap_above_collection_contract(self):
         with self.assertRaisesRegex(ValueError, "action_cap_m"):
@@ -353,6 +525,31 @@ class RealRobotSafetyTests(unittest.TestCase):
                 result, action=[0.0025, 0.0], latent_dim=3
             )
 
+    def test_validate_imagined_latent_rollout_checks_horizon_and_latent_shape(self):
+        expected = np.arange(15, dtype=np.float32).reshape(3, 5)
+        validated = validate_imagined_latent_rollout(
+            {"imagined_latent_rollout": expected},
+            horizon=3,
+            latent_dim=5,
+        )
+        np.testing.assert_array_equal(validated, expected)
+        self.assertIsNot(validated, expected)
+
+        with self.assertRaisesRegex(ValueError, "shape"):
+            validate_imagined_latent_rollout(
+                {"imagined_latent_rollout": np.zeros((2, 5), np.float32)},
+                horizon=3,
+                latent_dim=5,
+            )
+        invalid = expected.copy()
+        invalid[1, 2] = np.nan
+        with self.assertRaisesRegex(ValueError, "finite"):
+            validate_imagined_latent_rollout(
+                {"imagined_latent_rollout": invalid},
+                horizon=3,
+                latent_dim=5,
+            )
+
     def test_external_goal_loads_image_and_validates_video_arguments(self):
         class UnexpectedTransform:
             def apply(self, frame):
@@ -586,6 +783,10 @@ class RealRobotSafetyTests(unittest.TestCase):
             predicted = recorder.save_latent(
                 "trial_001_step_001", [1.5, 2.5, 3.5], predicted=True
             )
+            imagined = recorder.save_imagined_rollout(
+                "trial_001_step_001",
+                [[1.5, 2.5, 3.5], [2.0, 3.0, 4.0]],
+            )
             recorder.event("trial_started", frame=frame)
             run_path = recorder.path
             recorder.close()
@@ -603,6 +804,16 @@ class RealRobotSafetyTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 np.load(run_path / predicted),
                 np.array([1.5, 2.5, 3.5], np.float32),
+            )
+            self.assertEqual(
+                imagined,
+                "latents/z_hat_rollout/trial_001_step_001.npy",
+            )
+            np.testing.assert_array_equal(
+                np.load(run_path / imagined),
+                np.array(
+                    [[1.5, 2.5, 3.5], [2.0, 3.0, 4.0]], np.float32
+                ),
             )
 
     def test_planner_round_trip_has_a_response_deadline(self):

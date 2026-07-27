@@ -141,6 +141,24 @@ scripts/eval_pushbox_real.sh --dry-run --preflight
 scripts/eval_pushbox_real.sh --dry-run
 ```
 
+The same workflow can load the PushBox DINO-WM checkpoints trained on the
+`hpc` branch. Keep `weights_epoch_10.pt`, `config.json`, and
+`split_manifest.json` together, then preflight before enabling the robot:
+
+```bash
+scripts/eval_pushbox_real.sh --dry-run --preflight \
+  --world-model dinowm
+```
+
+DINO-WM uses the measured end-effector `[x, y, vx, vy]` proprioception and
+compares predicted DINOv2 image tokens with the goal image tokens. The launcher
+automatically selects a smaller batched categorical-CEM search for this larger
+spatial model; all values remain explicitly overridable. The checkpoint
+contains the frozen DINOv2-small weights, so real-robot inference does not
+download the Hugging Face backbone. It defaults to
+`stable-wm/checkpoints/dinowm_dinov2s_prop_4h/weights_epoch_10.pt`; pass
+`--checkpoint` only to select a different DINO-WM checkpoint.
+
 Instead of capturing a goal with `g`, open a recorded dataset video in the goal
 frame selector. This happens before the planner, camera, or robot starts:
 
@@ -169,7 +187,8 @@ prediction loss. Controls are:
 - `p`: start or pause autonomous planning and execution.
 - `SPACE`: cancel autonomous/manual motion by holding the measured pose.
 - `r`: return the arm to the configured start XY while paused.
-- `s` / `f`: label the active trial as success or failure.
+- `s` / `f`: label the active trial as success or failure, then wait for the
+  settled terminal-frame confirmation before quitting.
 - `q` or window close: pause, then run the collector's home-to-zero shutdown;
   after a latched fault, automatic recovery motion is deliberately skipped.
 
@@ -183,7 +202,9 @@ a new goal to start a new budget.
 Every interactive invocation writes a timestamped directory under
 `real_robot_runs/` containing resolved metadata, flushed JSONL events, goal and
 planning frames as lossless RGB PNG images, complete plans, timing,
-requested/accepted/executed actions, measured poses, and the final outcome. For
+requested/accepted/executed actions, measured poses, and the final outcome. A
+completed trial also stores `frames/trial_NNN_terminal.png` after settling and
+references it from the `trial_outcome` event. For
 every executed autonomous action it also saves projected encoder `z[t]` under
 `latents/z/` and the one-step predictor result `z_hat[t+1]` under
 `latents/z_hat/`, conditioned on the accepted physical XY action.

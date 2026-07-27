@@ -40,6 +40,33 @@ class RealLatentAlignmentTests(unittest.TestCase):
         # The terminal z_hat is intentionally not shifted under an absent t=3 frame.
         self.assertEqual(image.shape[1], 190 + 3 * 64)
 
+    def test_render_stride_keeps_prediction_aligned_to_original_time(self):
+        raw = [
+            np.full((224, 224, 3), value, dtype=np.uint8)
+            for value in (20, 40, 60)
+        ]
+        decoded_z = np.stack(
+            [np.full((224, 224, 3), value, dtype=np.uint8) for value in (80, 100, 120)]
+        )
+        decoded_z_hat = np.stack(
+            [np.full((224, 224, 3), value, dtype=np.uint8) for value in (140, 160, 180)]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "alignment.png")
+            render_alignment(
+                path,
+                raw,
+                decoded_z,
+                decoded_z_hat,
+                tile_size=64,
+                observation_indices=[0, 2],
+            )
+            image = np.asarray(Image.open(path))
+
+        self.assertEqual(image.shape, (300, 318, 3))
+        # Observation t=2 is paired with z_hat from action t=1, not action t=0.
+        np.testing.assert_array_equal(image[242, 286], [160, 160, 160])
+
 
 if __name__ == "__main__":
     unittest.main()

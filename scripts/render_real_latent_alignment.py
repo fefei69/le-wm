@@ -13,6 +13,7 @@ from typing import Any, Sequence
 import imageio.v3 as iio
 import numpy as np
 from PIL import Image, ImageDraw
+import stable_pretraining as spt
 import torch
 
 
@@ -25,6 +26,77 @@ from scripts.replay_real_cem_latents import (
     decode_latents,
     load_decoder,
 )
+from dino_decoder import DinoPatchDecoder
+
+
+def load_dino_decoder(
+    path: Path, device: torch.device
+) -> tuple[DinoPatchDecoder, dict[str, Any]]:
+    """Load the post-hoc DINO patch-token decoder produced on the HPC branch."""
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    required = {"state_dict", "args", "embedding_dim", "num_patches"}
+    if not isinstance(checkpoint, dict) or not required <= checkpoint.keys():
+        raise ValueError(
+            "DINO decoder checkpoint must contain state_dict, args, "
+            "embedding_dim, and num_patches"
+        )
+    decoder_args = dict(checkpoint["args"])
+    decoder = DinoPatchDecoder(
+        embedding_dim=int(checkpoint["embedding_dim"]),
+        image_size=int(decoder_args.get("image_size", 224)),
+        channels=int(decoder_args.get("channels", 384)),
+        num_residual_blocks=int(decoder_args.get("residual_blocks", 4)),
+        residual_channels=int(decoder_args.get("residual_channels", 128)),
+    ).to(device)
+    decoder.load_state_dict(checkpoint["state_dict"], strict=True)
+    decoder.eval().requires_grad_(False)
+    metadata = {
+        **decoder_args,
+        "embedding_dim": int(checkpoint["embedding_dim"]),
+        "num_patches": int(checkpoint["num_patches"]),
+        "checkpoint": str(checkpoint.get("source_checkpoint", "")),
+    }
+    return decoder, metadata
+
+
+def decode_dino_latents(
+    decoder: DinoPatchDecoder,
+    latents: torch.Tensor,
+    *,
+    num_patches: int,
+    embedding_dim: int,
+    batch_size: int,
+) -> np.ndarray:
+    expected = int(num_patches) * int(embedding_dim)
+    if latents.ndim != 2 or latents.shape[1] != expected:
+        raise ValueError(
+            f"flattened DINO latents must have shape (N, {expected}), "
+            f"got {tuple(latents.shape)}"
+        )
+    stats = spt.data.dataset_stats.ImageNet
+    mean = torch.as_tensor(
+        stats["mean"], dtype=torch.float32, device=latents.device
+    ).view(1, 3, 1, 1)
+    std = torch.as_tensor(
+        stats["std"], dtype=torch.float32, device=latents.device
+    ).view(1, 3, 1, 1)
+    frames: list[np.ndarray] = []
+    with torch.inference_mode():
+        for start in range(0, latents.shape[0], batch_size):
+            tokens = latents[start : start + batch_size].reshape(
+                -1, num_patches, embedding_dim
+            )
+            reconstruction = decoder(tokens)
+            rgb = (reconstruction * std + mean).clamp(0.0, 1.0)
+            frames.append(
+                rgb.permute(0, 2, 3, 1)
+                .mul(255.0)
+                .round()
+                .to(torch.uint8)
+                .cpu()
+                .numpy()
+            )
+    return np.concatenate(frames, axis=0)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -40,6 +112,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--tile-size", type=int, default=160)
     parser.add_argument("--decode-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--frame-stride",
+        type=int,
+        default=1,
+        help="show every Nth observation in latent_alignment.png (default: 1)",
+    )
     parser.add_argument(
         "--device", default="auto", help="torch device; auto selects CUDA if available"
     )
@@ -124,10 +202,23 @@ def render_alignment(
     decoded_z_hat: np.ndarray,
     *,
     tile_size: int,
+    observation_indices: Sequence[int] | None = None,
 ) -> None:
-    count = len(raw)
-    if len(decoded_z) != count or len(decoded_z_hat) != count:
+    observation_count = len(raw)
+    if len(decoded_z) != observation_count or len(decoded_z_hat) != observation_count:
         raise ValueError("raw, z, and z_hat sequences must have equal lengths")
+    indices = (
+        list(range(observation_count))
+        if observation_indices is None
+        else [int(index) for index in observation_indices]
+    )
+    if not indices:
+        raise ValueError("at least one observation must be selected")
+    if indices != sorted(set(indices)):
+        raise ValueError("observation indices must be unique and increasing")
+    if indices[0] < 0 or indices[-1] >= observation_count:
+        raise ValueError("observation index is outside the recorded sequence")
+    count = len(indices)
     gutter = 190
     header = 30
     row_gap = 26
@@ -140,23 +231,26 @@ def render_alignment(
         "decoded encoded z[t]",
         "decoded predicted z_hat[t]",
     )
-    for column in range(count):
+    for column, time_index in enumerate(indices):
         x = gutter + column * tile_size
-        draw.text((x + 4, 8), f"t={column:03d}", fill="white")
+        draw.text((x + 4, 8), f"t={time_index:03d}", fill="white")
     for row, label in enumerate(row_labels):
         y = header + row * (tile_size + row_gap)
         draw.text((8, y + tile_size // 2 - 6), label, fill="white")
     resampling = Image.Resampling.BILINEAR
-    for column, frame in enumerate(raw):
+    for column, time_index in enumerate(indices):
+        frame = raw[time_index]
         x = gutter + column * tile_size
         canvas.paste(Image.fromarray(frame).resize((tile_size, tile_size), resampling), (x, header))
         z_y = header + tile_size + row_gap
         canvas.paste(
-            Image.fromarray(decoded_z[column]).resize((tile_size, tile_size), resampling),
+            Image.fromarray(decoded_z[time_index]).resize(
+                (tile_size, tile_size), resampling
+            ),
             (x, z_y),
         )
         prediction_y = header + 2 * (tile_size + row_gap)
-        if column == 0:
+        if time_index == 0:
             draw.rectangle(
                 (x, prediction_y, x + tile_size - 1, prediction_y + tile_size - 1),
                 outline=(110, 110, 110),
@@ -169,15 +263,19 @@ def render_alignment(
                 align="center",
             )
         else:
-            # z_hat produced with action[column - 1] predicts observation[column].
+            # z_hat produced with action[t - 1] predicts observation[t].
             canvas.paste(
-                Image.fromarray(decoded_z_hat[column - 1]).resize(
+                Image.fromarray(decoded_z_hat[time_index - 1]).resize(
                     (tile_size, tile_size), resampling
                 ),
                 (x, prediction_y),
             )
         draw.text((x + 4, z_y + tile_size + 5), "encoder", fill=(210, 210, 210))
-        prediction_label = "none" if column == 0 else f"from action[{column - 1:03d}]"
+        prediction_label = (
+            "none"
+            if time_index == 0
+            else f"from action[{time_index - 1:03d}]"
+        )
         draw.text(
             (x + 4, prediction_y + tile_size + 5),
             prediction_label,
@@ -193,6 +291,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--tile-size must be at least 64")
     if args.decode_batch_size < 1:
         raise ValueError("--decode-batch-size must be positive")
+    if args.frame_stride < 1:
+        raise ValueError("--frame-stride must be positive")
     run_path = args.run.expanduser().resolve()
     metadata_path = run_path / "metadata.json"
     events_path = run_path / "events.jsonl"
@@ -226,7 +326,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         else ("cpu" if args.device == "auto" else args.device)
     )
     decoder_path = args.decoder.expanduser().resolve()
-    decoder, decoder_args = load_decoder(decoder_path, device)
+    world_model = str(
+        metadata.get("model_runtime", {}).get(
+            "world_model",
+            metadata.get("argv", {}).get("world_model", "lewm"),
+        )
+    )
+    if world_model not in {"lewm", "dinowm"}:
+        raise ValueError(f"unsupported world-model backend in run metadata: {world_model}")
+    if world_model == "dinowm":
+        decoder, decoder_args = load_dino_decoder(decoder_path, device)
+    else:
+        decoder, decoder_args = load_decoder(decoder_path, device)
     world_checkpoint = str(metadata.get("argv", {}).get("checkpoint", ""))
     decoder_checkpoint = str(decoder_args.get("checkpoint", ""))
     if not world_checkpoint or Path(world_checkpoint).name != Path(decoder_checkpoint).name:
@@ -234,16 +345,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"decoder was trained for {decoder_checkpoint}, but run used "
             f"{world_checkpoint or 'an unspecified checkpoint'}"
         )
-    if int(decoder.cls_proj[0].in_features) != encoded.shape[1]:
-        raise ValueError("decoder input dimension does not match saved latents")
 
     all_latents = torch.from_numpy(np.concatenate([encoded, predicted], axis=0)).to(
         device
     )
-    decoded = decode_latents(decoder, all_latents, args.decode_batch_size)
+    if world_model == "dinowm":
+        semantic_shape = metadata.get("model_runtime", {}).get(
+            "latent_semantic_shape"
+        )
+        expected_shape = [
+            int(decoder_args["num_patches"]),
+            int(decoder_args["embedding_dim"]),
+        ]
+        if semantic_shape != expected_shape:
+            raise ValueError(
+                "DINO decoder token shape does not match the saved run: "
+                f"{expected_shape} vs {semantic_shape}"
+            )
+        decoded = decode_dino_latents(
+            decoder,
+            all_latents,
+            num_patches=expected_shape[0],
+            embedding_dim=expected_shape[1],
+            batch_size=args.decode_batch_size,
+        )
+    else:
+        if int(decoder.cls_proj[0].in_features) != encoded.shape[1]:
+            raise ValueError("decoder input dimension does not match saved latents")
+        decoded = decode_latents(decoder, all_latents, args.decode_batch_size)
     decoded_z = decoded[: len(steps)]
     decoded_z_hat = decoded[len(steps) :]
     save_decoded_frames(output_path, decoded_z, decoded_z_hat)
+    figure_observation_indices = list(range(0, len(steps), args.frame_stride))
     figure_path = output_path / "latent_alignment.png"
     render_alignment(
         figure_path,
@@ -251,6 +384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         decoded_z,
         decoded_z_hat,
         tile_size=args.tile_size,
+        observation_indices=figure_observation_indices,
     )
 
     errors = np.square(
@@ -265,7 +399,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "source_run": str(run_path),
         "trial_id": args.trial_id,
         "observation_count": len(steps),
+        "figure_frame_stride": args.frame_stride,
+        "figure_observation_indices": figure_observation_indices,
         "latent_dim": encoded.shape[1],
+        "world_model": world_model,
         "decoder": str(decoder_path),
         "world_checkpoint": world_checkpoint,
         "alignment": {

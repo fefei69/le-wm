@@ -2,8 +2,9 @@
 
 The controller deliberately starts in dry-run mode.  Passing ``--execute`` is
 required before any Trossen connection or robot motion occurs.  The hardware
-loop runs in the ROS-compatible collector environment and delegates LeWM/CEM
-inference to :mod:`real_robot_planner` in this repository's virtualenv.
+loop runs in the ROS-compatible collector environment and delegates LeWM or
+DINO-WM inference and CEM search to :mod:`real_robot_planner` in this
+repository's virtualenv.
 """
 
 from __future__ import annotations
@@ -35,6 +36,10 @@ UI_SLEEP_MAX_S = 0.005
 RESET_STEP_M = 0.005
 RESET_TOLERANCE_M = 0.002
 MODEL_IMAGE_SHAPE = (224, 224, 3)
+DEFAULT_LEWM_CHECKPOINT = "pushbox/lewm/weights_epoch_146.pt"
+DEFAULT_DINOWM_CHECKPOINT = (
+    "stable-wm/checkpoints/dinowm_dinov2s_prop_4h/weights_epoch_10.pt"
+)
 DEFAULT_PLANNER_TIMEOUT_S = 2.0
 DEFAULT_MAX_PLAN_AGE_S = 2.0
 DEFAULT_MAX_OBSERVATION_DELAY_S = 0.3
@@ -191,6 +196,22 @@ def validate_transition_prediction(
     return encoded, predicted
 
 
+def validate_imagined_latent_rollout(
+    result: dict[str, Any], *, horizon: int, latent_dim: int
+) -> np.ndarray:
+    """Validate z_hat[t+1:t+H | t] from the selected MPC plan."""
+    rollout = np.asarray(result["imagined_latent_rollout"], dtype=np.float32)
+    expected_shape = (int(horizon), int(latent_dim))
+    if rollout.shape != expected_shape:
+        raise ValueError(
+            f"imagined latent rollout must have shape {expected_shape}, "
+            f"got {rollout.shape}"
+        )
+    if not np.isfinite(rollout).all():
+        raise ValueError("imagined latent rollout must be finite")
+    return rollout.copy()
+
+
 def validate_measured_pose(
     pose: Any,
     *,
@@ -258,6 +279,20 @@ def motion_completion_status(
         and linear_speed_m_s <= float(settled_linear_speed_m_s)
     )
     return complete, tracking_error_m, linear_speed_m_s
+
+
+def build_robot_proprio(pose: Any, velocity: Any) -> np.ndarray:
+    """Build the dataset's measured ``[x, y, vx, vy]`` proprioception row."""
+    measured_pose = np.asarray(pose, dtype=np.float64).reshape(-1)
+    measured_velocity = np.asarray(velocity, dtype=np.float64).reshape(-1)
+    if (
+        measured_pose.size < 2
+        or measured_velocity.size < 2
+        or not np.isfinite(measured_pose[:2]).all()
+        or not np.isfinite(measured_velocity[:2]).all()
+    ):
+        raise ValueError("robot proprioception requires finite XY pose and velocity")
+    return np.r_[measured_pose[:2], measured_velocity[:2]].astype(np.float32)
 
 
 def snapshot_follows_settle(
@@ -877,9 +912,11 @@ class RunRecorder:
         self.frames_path = self.path / "frames"
         self.encoded_latents_path = self.path / "latents" / "z"
         self.predicted_latents_path = self.path / "latents" / "z_hat"
+        self.imagined_rollouts_path = self.path / "latents" / "z_hat_rollout"
         self.frames_path.mkdir(parents=True, exist_ok=False)
         self.encoded_latents_path.mkdir(parents=True)
         self.predicted_latents_path.mkdir(parents=True)
+        self.imagined_rollouts_path.mkdir(parents=True)
         (self.path / "metadata.json").write_text(
             json.dumps(_jsonable(metadata), indent=2, sort_keys=True) + "\n"
         )
@@ -910,6 +947,22 @@ class RunRecorder:
             raise ValueError("latent must be a finite non-empty one-dimensional array")
         category = "z_hat" if predicted else "z"
         relative = Path("latents", category, f"{name}.npy")
+        np.save(self.path / relative, array, allow_pickle=False)
+        return str(relative)
+
+    def save_imagined_rollout(self, name: str, rollout: Any) -> str:
+        """Save recursively predicted z_hat[t+1:t+H | t] as float32."""
+        array = np.asarray(rollout, dtype=np.float32)
+        if (
+            array.ndim != 2
+            or array.shape[0] < 1
+            or array.shape[1] < 1
+            or not np.isfinite(array).all()
+        ):
+            raise ValueError(
+                "imagined latent rollout must be a finite non-empty 2-D array"
+            )
+        relative = Path("latents", "z_hat_rollout", f"{name}.npy")
         np.save(self.path / relative, array, allow_pickle=False)
         return str(relative)
 
@@ -1122,7 +1175,7 @@ class RealRobotUI:
 
 
 class PlannerProcess:
-    """Own the LeWM subprocess and serialize requests on one worker thread."""
+    """Own the world-model subprocess and serialize requests on one worker."""
 
     def __init__(self, args: argparse.Namespace, repo_root: Path) -> None:
         self.args = args
@@ -1148,6 +1201,8 @@ class PlannerProcess:
             self.authkey.hex(),
             "--checkpoint",
             self.args.checkpoint,
+            "--world-model",
+            self.args.world_model,
             "--dataset",
             str(self.args.dataset),
             "--device",
@@ -1172,9 +1227,13 @@ class PlannerProcess:
             str(self.args.categorical_alpha),
             "--categorical-min-prob",
             str(self.args.categorical_min_prob),
+            "--cem-batch-size",
+            str(self.args.cem_batch_size),
             "--seed",
             str(self.args.seed),
         ]
+        if self.args.model_manifest is not None:
+            command.extend(["--model-manifest", str(self.args.model_manifest)])
         if self.args.artifact_manifest is not None:
             command.extend(["--artifact-manifest", str(self.args.artifact_manifest)])
         environment = os.environ.copy()
@@ -1217,6 +1276,7 @@ class PlannerProcess:
         *,
         reset: bool,
         previous_action: np.ndarray | None,
+        current_proprio: np.ndarray,
     ) -> Future:
         return self.executor.submit(
             self._round_trip,
@@ -1230,8 +1290,15 @@ class PlannerProcess:
                     if previous_action is None
                     else np.asarray(previous_action, dtype=np.float32).copy()
                 ),
+                "current_proprio": np.asarray(
+                    current_proprio, dtype=np.float32
+                ).copy(),
             },
         )
+
+    def describe(self) -> dict[str, Any]:
+        """Return the loaded model's authoritative runtime dimensions."""
+        return self._round_trip({"op": "describe"})
 
     def predict_next(self, action: np.ndarray) -> dict[str, Any]:
         """Return z[t] and z_hat[t+1] for the exact accepted robot action."""
@@ -1276,7 +1343,29 @@ def _build_parser(repo_root: Path) -> argparse.ArgumentParser:
         default=repo_root / "stable-wm/datasets/pushbox_pilot_train.h5",
     )
     parser.add_argument(
-        "--checkpoint", default="pushbox/lewm/weights_epoch_146.pt"
+        "--checkpoint",
+        default=None,
+        help=(
+            "world-model checkpoint; defaults to epoch-146 LeWM or the local "
+            "epoch-10 4-hour DINO-WM checkpoint according to --world-model"
+        ),
+    )
+    parser.add_argument(
+        "--world-model",
+        choices=("lewm", "dinowm"),
+        default="lewm",
+        help=(
+            "lewm uses the projected global latent; dinowm uses spatial "
+            "DINOv2 tokens with action/proprio conditioning"
+        ),
+    )
+    parser.add_argument(
+        "--model-manifest",
+        type=Path,
+        help=(
+            "DINO-WM split_manifest.json containing the exact train-subset "
+            "action/proprio normalization; defaults beside the checkpoint"
+        ),
     )
     goal_source = parser.add_mutually_exclusive_group()
     goal_source.add_argument(
@@ -1386,6 +1475,15 @@ def _build_parser(repo_root: Path) -> argparse.ArgumentParser:
         default=0.01,
         help="per-token exploration floor for --solver categorical-cem",
     )
+    parser.add_argument(
+        "--cem-batch-size",
+        type=int,
+        default=0,
+        help=(
+            "evaluate candidate rollouts in batches; zero uses all samples at "
+            "once (DINO-WM should use a bounded value such as 32)"
+        ),
+    )
     parser.add_argument("--planner-start-timeout", type=float, default=120.0)
     parser.add_argument("--planner-timeout", type=float, default=DEFAULT_PLANNER_TIMEOUT_S)
     parser.add_argument("--max-plan-age", type=float, default=DEFAULT_MAX_PLAN_AGE_S)
@@ -1468,6 +1566,73 @@ def _workspace_bounds(
     return None
 
 
+def _resolve_model_artifacts(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    repo_root: Path,
+) -> None:
+    """Resolve model files before applying the collection artifact contract."""
+    if args.checkpoint is None:
+        args.checkpoint = (
+            DEFAULT_DINOWM_CHECKPOINT
+            if args.world_model == "dinowm"
+            else DEFAULT_LEWM_CHECKPOINT
+        )
+
+    artifact_root = Path(
+        os.environ.get("STABLEWM_HOME", str(repo_root / "stable-wm"))
+    ).expanduser().resolve()
+    supplied = Path(args.checkpoint).expanduser()
+    candidates = (
+        [supplied]
+        if supplied.is_absolute()
+        else [repo_root / supplied, supplied, artifact_root / "checkpoints" / supplied]
+    )
+    checkpoint = next(
+        (candidate.resolve() for candidate in candidates if candidate.is_file()),
+        candidates[-1].resolve(),
+    )
+    if not checkpoint.is_file():
+        parser.error(f"world-model checkpoint does not exist: {checkpoint}")
+    if not (checkpoint.parent / "config.json").is_file():
+        parser.error(f"config.json is missing beside checkpoint: {checkpoint}")
+    args.checkpoint = str(checkpoint)
+
+    if args.world_model == "lewm":
+        if args.model_manifest is not None:
+            parser.error("--model-manifest is only used with --world-model dinowm")
+        return
+
+    manifest = (
+        args.model_manifest.expanduser()
+        if args.model_manifest is not None
+        else checkpoint.parent / "split_manifest.json"
+    )
+    if not manifest.is_absolute():
+        repository_manifest = repo_root / manifest
+        manifest = (
+            repository_manifest
+            if repository_manifest.is_file()
+            else manifest
+        )
+    manifest = manifest.resolve()
+    if not manifest.is_file():
+        parser.error(
+            "DINO-WM requires its split_manifest.json for exact action and "
+            f"proprio normalization: {manifest}"
+        )
+    try:
+        contents = json.loads(manifest.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        parser.error(f"invalid DINO-WM model manifest {manifest}: {exc}")
+    if not all(
+        key in contents
+        for key in ("train_episode_indices", "normalization", "sample_hz")
+    ):
+        parser.error("DINO-WM model manifest is missing required training metadata")
+    args.model_manifest = manifest
+
+
 def _validate_artifact_contract(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -1507,7 +1672,7 @@ def _validate_artifact_contract(
     mismatches = []
     if supplied_dataset != expected_dataset:
         mismatches.append(f"dataset {supplied_dataset} != {expected_dataset}")
-    if supplied_checkpoint != expected_checkpoint:
+    if args.world_model == "lewm" and supplied_checkpoint != expected_checkpoint:
         mismatches.append(f"checkpoint {supplied_checkpoint} != {expected_checkpoint}")
 
     runtime = manifest["runtime"]
@@ -1537,10 +1702,18 @@ def _validate_artifact_contract(
         args.artifact_manifest = None
         return None
 
-    if not expected_checkpoint.is_file() or not expected_dataset.is_file():
-        parser.error("manifest checkpoint or dataset file is missing")
-    if _sha256(expected_checkpoint) != manifest["world_model"]["checkpoint_sha256"]:
-        parser.error("checkpoint SHA-256 does not match the artifact manifest")
+    if not expected_dataset.is_file():
+        parser.error("manifest dataset file is missing")
+    if args.world_model == "lewm":
+        if not expected_checkpoint.is_file():
+            parser.error("manifest checkpoint file is missing")
+        if _sha256(expected_checkpoint) != manifest["world_model"]["checkpoint_sha256"]:
+            parser.error("checkpoint SHA-256 does not match the artifact manifest")
+    else:
+        print(
+            "Using the real-robot manifest for dataset/camera/control compatibility; "
+            "the DINO-WM checkpoint is validated against --model-manifest."
+        )
     if args.execute or args.verify_dataset_hash:
         print("Verifying dataset SHA-256 (this reads the complete dataset)...")
         if _sha256(expected_dataset) != manifest["dataset"]["sha256"]:
@@ -1567,6 +1740,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         else collector_repo / "config/camera-params.yaml"
     )
     args.dataset = args.dataset.expanduser().resolve()
+    _resolve_model_artifacts(args, parser, repo_root)
     if args.goal_image is not None:
         args.goal_image = (
             args.goal_image.expanduser()
@@ -1706,6 +1880,11 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         or not 0.0 <= args.categorical_min_prob < 1.0
     ):
         parser.error("--categorical-min-prob must be finite and in [0, 1)")
+    if args.cem_batch_size < 0:
+        parser.error("--cem-batch-size must be non-negative")
+    if args.world_model == "dinowm" and args.cem_batch_size == 0:
+        args.cem_batch_size = 32
+        print("DINO-WM: defaulting --cem-batch-size to 32")
     if args.solver == "categorical-cem" and args.action_mode != "keyboard":
         parser.error("--solver categorical-cem requires --action-mode keyboard")
     if args.motion_settle_timeout <= TICK_S + args.tracking_settle_grace:
@@ -1735,11 +1914,6 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         repo_root,
         args.transform_profile,
         args.camera_params,
-    )
-    latent_dim = int(
-        artifact_manifest["runtime"]["latent_dim"]
-        if artifact_manifest is not None
-        else 192
     )
     external_initial: np.ndarray | None = None
     if dataset_pair is not None:
@@ -1776,10 +1950,12 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     print(f"Starting real PushBox evaluation in {mode_name} mode")
     print(
         "Planner configuration: "
-        f"solver={args.solver}, action_mode={args.action_mode}, "
+        f"world_model={args.world_model}, solver={args.solver}, "
+        f"action_mode={args.action_mode}, "
         f"horizon={args.horizon}, "
         f"samples={args.num_samples}, iterations={args.iterations}, "
-        f"elites={args.elite_count}, action_cap={args.action_cap:g} m, "
+        f"elites={args.elite_count}, cem_batch={args.cem_batch_size or 'all'}, "
+        f"action_cap={args.action_cap:g} m, "
         f"max_actions={args.max_actions}"
     )
     if args.negate_planner_action:
@@ -1800,9 +1976,30 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     except Exception:
         planner.close()
         raise
+    model_runtime = planner.describe()
+    if model_runtime.get("world_model") != args.world_model:
+        planner.close()
+        raise RuntimeError(
+            "planner loaded world-model backend "
+            f"{model_runtime.get('world_model')!r}, expected {args.world_model!r}"
+        )
+    latent_dim = int(model_runtime["latent_dim"])
+    if latent_dim < 1:
+        planner.close()
+        raise RuntimeError("planner reported a non-positive latent dimension")
+    if (
+        args.world_model == "lewm"
+        and artifact_manifest is not None
+        and latent_dim != int(artifact_manifest["runtime"]["latent_dim"])
+    ):
+        planner.close()
+        raise RuntimeError(
+            "loaded LeWM latent dimension does not match the artifact manifest"
+        )
     if args.preflight:
         print(
-            "preflight passed: artifact contract, model, dataset, planner, and "
+            f"preflight passed: {args.world_model} artifact contract, model, "
+            "dataset, planner, and "
             "collector modules are ready; display, camera, and robot were not accessed"
         )
         planner.close()
@@ -1828,17 +2025,30 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 "argv": vars(args),
                 "mode": mode_name,
                 "artifact_manifest": artifact_manifest,
+                "model_runtime": model_runtime,
                 "collector_repo": collector_repo,
                 "transform_profile_sha256": _sha256(args.transform_profile),
                 "camera_params_sha256": _sha256(args.camera_params),
                 "external_goal_source": external_goal_source,
                 "latent_artifacts": {
-                    "z": "projected encoder latent of observation[t]",
+                    "z": (
+                        f"{model_runtime['latent_representation']} encoding of "
+                        "observation[t]"
+                    ),
                     "z_hat": (
                         "one-step predictor latent for observation[t+1], "
                         "conditioned on the accepted robot action[t]"
                     ),
+                    "z_hat_rollout": (
+                        "selected MPC plan's recursively predicted latent "
+                        "states z_hat[t+1:t+H | t], flattened per state to "
+                        "shape [horizon, latent_dim]. Each prediction is fed "
+                        "back to predict the next state, so error compounds; "
+                        "combine with z[t] for the full t:t+H path"
+                    ),
                     "dtype": "float32",
+                    "storage_shape": model_runtime["latent_storage_shape"],
+                    "semantic_shape": model_runtime["latent_semantic_shape"],
                     "alignment": "z[t] + action[t] -> z_hat[t+1]",
                 },
             },
@@ -1925,6 +2135,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         action_count = 0
         trial_id = 1 if external_goal is not None else 0
         trial_complete = external_goal is None
+        pending_trial_outcome: str | None = None
         latest_action = np.zeros(2, dtype=np.float32)
         latest_plan = np.zeros((args.horizon, 2), dtype=np.float32)
         latest_cost: float | None = None
@@ -1932,6 +2143,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         latest_goal_distance: float | None = None
         latest_action_probabilities: np.ndarray | None = None
         latest_action_vocabulary: np.ndarray | None = None
+        latest_imagined_latent_rollout: np.ndarray | None = None
         next_plan_time = 0.0
         previous_executed_action: np.ndarray | None = None
         faulted = False
@@ -1940,12 +2152,14 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         motion_settle_deadline = 0.0
         motion_command_ns: int | None = None
         settled_observation_after_ns: int | None = None
+        settled_proprio: np.ndarray | None = None
         last_pose: np.ndarray | None = None
         last_command_ns: int | None = None
         pending_started_at = 0.0
         pending_frame_receipt_ns = 0
         pending_frame_sequence = -1
         pending_current: np.ndarray | None = None
+        pending_proprio: np.ndarray | None = None
         pending_command_to_capture_s: float | None = None
         pending_settle_to_capture_s: float | None = None
 
@@ -1981,6 +2195,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         def mark_motion_pending(command_ns: int | None = None) -> None:
             nonlocal tracking_check_after, motion_settle_deadline
             nonlocal motion_command_ns, settled_observation_after_ns
+            nonlocal settled_proprio
             issued_ns = time.monotonic_ns() if command_ns is None else int(command_ns)
             issued_s = issued_ns / 1e9
             motion_command_ns = issued_ns
@@ -1989,6 +2204,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             )
             motion_settle_deadline = issued_s + args.motion_settle_timeout
             settled_observation_after_ns = None
+            settled_proprio = None
 
         def read_pose(*, require_tracking: bool) -> np.ndarray:
             if not args.execute or arm is None:
@@ -2034,6 +2250,52 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 hold_measured_pose()
             recorder.event("paused", reason=reason, held_measured_pose=hold)
 
+        def record_trial_outcome(
+            outcome: str,
+            frame: np.ndarray,
+            *,
+            camera_sequence: int | None,
+            command_to_capture_s: float | None,
+            settle_to_capture_s: float | None,
+        ) -> None:
+            nonlocal pending_trial_outcome, trial_complete
+            terminal = np.asarray(frame, dtype=np.uint8)
+            if terminal.shape != MODEL_IMAGE_SHAPE:
+                raise ValueError("terminal observation has an invalid shape")
+            terminal_path = recorder.save_frame(
+                f"trial_{trial_id:03d}_terminal", terminal
+            )
+            recorder.event(
+                "trial_outcome",
+                trial_id=trial_id,
+                outcome=outcome,
+                terminal_frame=terminal_path,
+                terminal_camera_sequence=camera_sequence,
+                terminal_action_count=action_count,
+                terminal_after_settle=bool(
+                    args.execute and settled_observation_after_ns is not None
+                ),
+                terminal_command_to_capture_s=command_to_capture_s,
+                terminal_settle_to_capture_s=settle_to_capture_s,
+                terminal_capture_status="settled_post_action",
+            )
+            pending_trial_outcome = None
+            trial_complete = True
+            print(f"trial {outcome}: saved settled terminal observation")
+
+        def request_trial_outcome(
+            outcome: str, *, reason: str, hold: bool
+        ) -> None:
+            nonlocal pending_trial_outcome, trial_complete, next_plan_time
+            pause(reason, hold=hold)
+            pending_trial_outcome = outcome
+            next_plan_time = tracking_check_after if args.execute else 0.0
+            trial_complete = True
+            print(
+                f"trial {outcome}: waiting for robot settle and a newer "
+                "terminal camera frame"
+            )
+
         def latch_fault(reason: str) -> None:
             nonlocal faulted, fault_reason
             if faulted:
@@ -2050,8 +2312,24 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         while not quit_requested:
             events = ui.poll()
             intent = prioritize_ui_events(events)
+            if (
+                pending_trial_outcome is not None
+                and intent is not None
+                and intent[0] not in {"quit", "pause"}
+            ):
+                print("waiting for the pending terminal observation")
+                intent = None
             if intent is not None and intent[0] == "quit":
-                if not trial_complete:
+                if pending_trial_outcome is not None:
+                    recorder.event(
+                        "trial_outcome",
+                        trial_id=trial_id,
+                        outcome=pending_trial_outcome,
+                        terminal_frame=None,
+                        terminal_capture_status="interrupted_by_operator_quit",
+                    )
+                    pending_trial_outcome = None
+                elif not trial_complete:
                     recorder.event("trial_outcome", trial_id=trial_id, outcome="abort")
                 pause("operator quit", hold=not faulted)
                 quit_requested = True
@@ -2063,10 +2341,10 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 if goal is None or trial_complete:
                     print("no active trial to label")
                 else:
-                    pause(f"trial marked {intent[1]}", hold=True)
-                    trial_complete = True
-                    recorder.event(
-                        "trial_outcome", trial_id=trial_id, outcome=intent[1]
+                    request_trial_outcome(
+                        str(intent[1]),
+                        reason=f"trial marked {intent[1]}",
+                        hold=True,
                     )
             elif intent is not None and intent[0] == "reset":
                 if faulted:
@@ -2214,6 +2492,15 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                     cap_m=args.action_cap,
                                     at_goal=at_goal,
                                 )
+                                latest_imagined_latent_rollout = (
+                                    None
+                                    if at_goal
+                                    else validate_imagined_latent_rollout(
+                                        result,
+                                        horizon=args.horizon,
+                                        latent_dim=latent_dim,
+                                    )
+                                )
                             except (KeyError, TypeError, ValueError) as exc:
                                 latch_fault(f"unsafe planner output: {exc}")
 
@@ -2221,9 +2508,12 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                             pass
                         elif at_goal and autonomous:
                             pause("goal tolerance reached", hold=False)
-                            trial_complete = True
-                            recorder.event(
-                                "trial_outcome", trial_id=trial_id, outcome="at_goal"
+                            record_trial_outcome(
+                                "at_goal",
+                                pending_current,
+                                camera_sequence=pending_frame_sequence,
+                                command_to_capture_s=pending_command_to_capture_s,
+                                settle_to_capture_s=pending_settle_to_capture_s,
                             )
                         elif at_goal and preview_once:
                             preview_once = False
@@ -2244,6 +2534,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                 solve_time_s=latest_solve_s,
                                 plan_age_s=plan_age_s,
                                 settle_to_capture_s=pending_settle_to_capture_s,
+                                observation_proprio=pending_proprio,
                                 at_goal=True,
                                 solver=args.solver,
                                 action_probabilities=latest_action_probabilities,
@@ -2336,16 +2627,22 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                         f"trial_{trial_id:03d}_step_{action_count:03d}",
                                         pending_current,
                                     )
+                                    latent_name = (
+                                        f"trial_{trial_id:03d}_step_"
+                                        f"{action_count:03d}"
+                                    )
                                     encoded_latent_path = None
                                     predicted_latent_path = None
+                                    imagined_latent_rollout_path = (
+                                        recorder.save_imagined_rollout(
+                                            latent_name,
+                                            latest_imagined_latent_rollout,
+                                        )
+                                    )
                                     if (
                                         encoded_latent is not None
                                         and predicted_next_latent is not None
                                     ):
-                                        latent_name = (
-                                            f"trial_{trial_id:03d}_step_"
-                                            f"{action_count:03d}"
-                                        )
                                         encoded_latent_path = recorder.save_latent(
                                             latent_name,
                                             encoded_latent,
@@ -2369,7 +2666,12 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                             else None
                                         ),
                                         latent_prediction_s=latent_prediction_s,
+                                        imagined_latent_rollout=(
+                                            imagined_latent_rollout_path
+                                        ),
+                                        planner_replanned=True,
                                         camera_sequence=pending_frame_sequence,
+                                        observation_proprio=pending_proprio,
                                         plan_age_s=plan_age_s,
                                         command_to_capture_s=pending_command_to_capture_s,
                                         settle_to_capture_s=pending_settle_to_capture_s,
@@ -2403,15 +2705,10 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                         f"goal_distance={latest_goal_distance:.6g}"
                                     )
                                     if action_count >= args.max_actions:
-                                        pause(
-                                            "maximum trial action count reached",
+                                        request_trial_outcome(
+                                            "budget_exhausted",
+                                            reason="maximum trial action count reached",
                                             hold=False,
-                                        )
-                                        trial_complete = True
-                                        recorder.event(
-                                            "trial_outcome",
-                                            trial_id=trial_id,
-                                            outcome="budget_exhausted",
                                         )
                         elif preview_once:
                             preview_once = False
@@ -2435,6 +2732,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                 solve_time_s=latest_solve_s,
                                 plan_age_s=plan_age_s,
                                 settle_to_capture_s=pending_settle_to_capture_s,
+                                observation_proprio=pending_proprio,
                             )
                             print(
                                 f"preview planner={latest_action.tolist()}, "
@@ -2444,6 +2742,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                             )
                 pending = None
                 pending_current = None
+                pending_proprio = None
 
             now = time.monotonic()
             if now >= next_tick:
@@ -2451,7 +2750,11 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 if args.execute and arm is not None:
                     try:
                         awaiting_planner_settle = (
-                            (autonomous or preview_once)
+                            (
+                                autonomous
+                                or preview_once
+                                or pending_trial_outcome is not None
+                            )
                             and settled_observation_after_ns is None
                         )
                         last_pose = read_pose(
@@ -2463,7 +2766,12 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                     except (RuntimeError, ValueError) as exc:
                         latch_fault(f"pose verification failed: {exc}")
 
-                if not faulted and not autonomous and not preview_once:
+                if (
+                    not faulted
+                    and not autonomous
+                    and not preview_once
+                    and pending_trial_outcome is None
+                ):
                     manual_action = ui.manual_action()
                     if np.linalg.norm(manual_action) > 0.0:
                         resetting = False
@@ -2518,11 +2826,13 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             # Begin completion checks after the nominal 0.2-second trajectory,
             # then plan only from a camera receipt newer than verified settling.
             now = time.monotonic()
-            wants_plan = not faulted and (autonomous or preview_once)
+            wants_plan = not faulted and (
+                autonomous or preview_once or pending_trial_outcome is not None
+            )
             if (
                 wants_plan
                 and goal is not None
-                and pending is None
+                and (pending is None or pending_trial_outcome is not None)
                 and now >= next_plan_time
             ):
                 ready_for_snapshot = True
@@ -2545,6 +2855,9 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                         else:
                             if complete:
                                 last_pose = measured
+                                settled_proprio = build_robot_proprio(
+                                    measured, velocity
+                                )
                                 settled_observation_after_ns = time.monotonic_ns()
                                 settle_time_s = (
                                     None
@@ -2627,6 +2940,33 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                     f"{args.max_observation_delay:.3f}s]"
                                 )
                             else:
+                                if pending_trial_outcome is not None:
+                                    plan_sequence = snapshot.sequence
+                                    record_trial_outcome(
+                                        pending_trial_outcome,
+                                        current,
+                                        camera_sequence=snapshot.sequence,
+                                        command_to_capture_s=command_to_capture_s,
+                                        settle_to_capture_s=settle_to_capture_s,
+                                    )
+                                    continue
+                                current_proprio = (
+                                    settled_proprio.copy()
+                                    if settled_proprio is not None
+                                    else build_robot_proprio(
+                                        np.r_[
+                                            target_xy,
+                                            config.fixed_z,
+                                            FIXED_ORIENTATION,
+                                        ],
+                                        np.zeros(6, dtype=np.float64),
+                                    )
+                                )
+                                if args.execute and settled_proprio is None:
+                                    latch_fault(
+                                        "settled robot proprioception is unavailable"
+                                    )
+                                    continue
                                 plan_sequence = snapshot.sequence
                                 pending_generation = generation
                                 pending_started_at = now
@@ -2635,6 +2975,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                 )
                                 pending_frame_sequence = snapshot.sequence
                                 pending_current = current.copy()
+                                pending_proprio = current_proprio.copy()
                                 pending_command_to_capture_s = command_to_capture_s
                                 pending_settle_to_capture_s = settle_to_capture_s
                                 pending = planner.plan(
@@ -2642,6 +2983,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                                     goal,
                                     reset=reset_planner,
                                     previous_action=previous_executed_action,
+                                    current_proprio=current_proprio,
                                 )
                                 reset_planner = False
                                 previous_executed_action = None

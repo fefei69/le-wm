@@ -1,6 +1,6 @@
 # Real-Robot PushBox Evaluation
 
-## Implementation update — July 20, 2026
+## Implementation update — July 23, 2026
 
 This document summarizes the real-robot evaluation pipeline introduced in
 commit `8065dde` (`Add real robot PushBox evaluation pipeline`). The pipeline
@@ -12,8 +12,8 @@ planning, reproducible run records, and offline model diagnostics.
 - `real_robot_eval.py` owns the camera, UI, Trossen arm connection, safety
   checks, command execution, and run recording. It runs with the ROS-compatible
   Python 3.12 environment from the sibling `wm_data_collection` repository.
-- `real_robot_planner.py` loads LeWM and performs CEM planning in this
-  repository's Python 3.10 virtual environment.
+- `real_robot_planner.py` loads either LeWM or DINO-WM and performs CEM
+  planning in this repository's Python 3.10 virtual environment.
 - The two processes communicate through a local authenticated Unix socket. No
   ROS or Trossen modules are imported into the model process.
 - `scripts/eval_pushbox_real.sh` supplies the commissioned robot pose,
@@ -101,12 +101,74 @@ Categorical preview and autonomous-step records include
 `action_vocabulary`, so convergence and competing directional modes can be
 inspected directly in `events.jsonl`.
 
+### DINO-WM backend
+
+`--world-model dinowm` selects the DINO-WM pipeline trained on the `hpc`
+branch. It preserves the existing UI, goal-image/video/dataset selection,
+Gaussian or categorical CEM, one-action MPC execution, safety gates, and run
+directory layout.
+
+The runtime contract is:
+
+- `weights_epoch_10.pt` and its sibling `config.json` provide the full frozen
+  DINOv2-small backbone, action/proprio encoders, and causal predictor;
+- the sibling `split_manifest.json` provides the exact episode-subset action
+  and proprio normalization used for that checkpoint;
+- the evaluator measures proprioception as `[x, y, vx, vy]`, exactly matching
+  data collection, after the arm has reached the commanded pose;
+- the predictor context contains 256 spatial DINO patches per frame. Every
+  observed context state receives the action actually associated with that
+  state, and every recursive prediction receives the candidate action for that
+  rollout step;
+- goal distance and CEM terminal cost compare only the 384-dimensional image
+  portion of each predicted patch against the goal image. Proprioception and
+  action condition the dynamics but do not become part of the visual goal;
+- saved `z` and `z_hat` remain one-dimensional `.npy` arrays for compatibility,
+  with the 256 x 384 token structure recorded in `metadata.json` as
+  `latent_semantic_shape`.
+
+The loader reconstructs the known DINOv2-small architecture locally and
+strictly loads its weights from the world-model checkpoint. A Hugging Face
+download is therefore not required for evaluation.
+
+Because spatial DINO rollouts are much larger than LeWM's single 192-D vector,
+`--cem-batch-size` bounds candidate memory. When selected through the shell
+launcher, DINO-WM defaults to categorical CEM with horizon 5, 64 samples,
+3 iterations, 8 elites, and batches of 32. These are operational starting
+values, not a claim that the optimizer is tuned; explicit command-line values
+still override them.
+
+Expected checkpoint layout:
+
+```text
+dinowm_dinov2s_prop_4h/
+├── config.json
+├── split_manifest.json
+└── weights_epoch_10.pt
+```
+
+Run the no-hardware gate first:
+
+```bash
+scripts/eval_pushbox_real.sh --dry-run --preflight \
+  --world-model dinowm
+```
+
+This selects
+`stable-wm/checkpoints/dinowm_dinov2s_prop_4h/weights_epoch_10.pt` by default.
+An explicit `--checkpoint` still overrides it.
+Use `--model-manifest /other/path/split_manifest.json` only when the manifest
+is not beside the checkpoint.
+
 ### Artifact contract and run records
 
 `config/real_robot_eval.json` records the expected checkpoint, dataset,
 camera-transform hashes, train/validation split, action normalization, latent
 dimension, history length, action axes, and control rate. Live evaluation fails
 closed on a contract mismatch unless the commissioning-only override is given.
+For DINO-WM, its LeWM-specific checkpoint/latent entries are replaced by the
+selected checkpoint's `split_manifest.json`; the shared dataset, camera,
+transform, control-rate, action-axis, and workspace contracts still apply.
 
 Every invocation creates a timestamped directory under `real_robot_runs/` with:
 
@@ -119,9 +181,151 @@ Every invocation creates a timestamped directory under `real_robot_runs/` with:
   latency.
 - projected observation latents in `latents/z/` and accepted-action-conditioned
   one-step predictions in `latents/z_hat/` for every executed autonomous step.
+- the selected plan's complete compounded latent trajectory in
+  `latents/z_hat_rollout/`, saved as one `(horizon, latent_dim)` float32 matrix
+  for every executed autonomous step.
+- for DINO-WM runs, the exact observation proprioception used by the model and
+  the authoritative flattened/semantic latent shapes.
 
 `real_robot_runs/` and derived `outputs/` remain ignored by Git so hardware data
 and large diagnostic artifacts are not accidentally committed.
+
+#### Full imagined trajectory
+
+LeWM and DINO-WM both recursively roll the selected CEM action sequence through
+their world model before returning the first MPC action. The evaluator now
+retains those states instead of discarding them after planning:
+
+```text
+latents/z/trial_NNN_step_MMM.npy
+    z[t], shape (latent_dim,)
+
+latents/z_hat/trial_NNN_step_MMM.npy
+    accepted-action one-step z_hat[t+1], shape (latent_dim,)
+
+latents/z_hat_rollout/trial_NNN_step_MMM.npy
+    selected-plan z_hat[t+1:t+H | t], shape (horizon, latent_dim)
+```
+
+Row `k-1` of `z_hat_rollout` is `z_hat[t+k | t]`. Each predicted state is fed
+back to predict the next row, so rollout error compounds over the horizon. The
+complete state path for visualization is:
+
+```python
+from pathlib import Path
+import numpy as np
+
+run = Path("real_robot_runs/RUN_ID")
+name = "trial_001_step_001.npy"
+z_t = np.load(run / "latents/z" / name)
+z_hat = np.load(run / "latents/z_hat_rollout" / name)
+z_t_through_h = np.concatenate([z_t[None], z_hat], axis=0)  # (H + 1, D)
+```
+
+The evaluator performs fresh receding-horizon planning for every action, so
+every `autonomous_step` has an `imagined_latent_rollout` path and records
+`planner_replanned: true`. The rollout is aligned with the selected `plan`
+stored in that event. The legacy one-step `z_hat` is deliberately different in
+meaning: it is recomputed using the accepted robot action after deadband,
+coordinate conversion, and workspace clipping. Its value should match rollout
+row 0 when the selected first action is accepted unchanged, but may differ when
+the safety layer changes that action.
+
+For DINO-WM, every spatial `(num_patches, pixel_dim)` state is flattened to the
+same `latent_dim` convention used by the existing `z` and `z_hat` files. Recover
+the spatial shape using `metadata.json`'s
+`model_runtime.latent_semantic_shape`.
+
+### Named real-robot experiments
+
+`config/real_robot_experiments.json` is a small registry for repeatable
+case/method comparisons. A case fixes the source video and both frame indices;
+a method fixes the repository, world model, solver, and planner overrides:
+
+```json
+{
+  "cases": {
+    "test01": {
+      "dataset_episode": "datasets_videos/20260715_180541/ep_005.mp4",
+      "initial_step": 80,
+      "goal_step": 160
+    }
+  }
+}
+```
+
+The checked-in methods cover:
+
+- `lewm_cem`
+- `dinowm_categorical_cem`
+- `discrete_cem`
+- `discrete_mcts`
+
+List the registry or verify one combination without hardware:
+
+```bash
+.venv/bin/python scripts/run_real_robot_experiment.py --list
+
+.venv/bin/python scripts/run_real_robot_experiment.py \
+  --case test01 \
+  --method discrete_mcts \
+  --preflight
+```
+
+Run one live, operator-supervised experiment:
+
+```bash
+.venv/bin/python scripts/run_real_robot_experiment.py \
+  --case test01 \
+  --method discrete_mcts \
+  --execute
+```
+
+Run multiple independent repetitions of one case/method with the wrapper:
+
+```bash
+scripts/run_real_robot_repetitions.sh \
+  --case test01 \
+  --method discrete_mcts \
+  --repetitions 5 \
+  --execute
+```
+
+The wrapper pauses before every live repetition so the operator can restore the
+box and clear the workspace. Each repetition is a separate timestamped run with
+`trial_001`; normal postprocessing finishes before the next prompt. `--trial-id`
+is intentionally not used as a repetition counter. The defaults at the top of
+the script can also be overridden with `CASE_NAME`, `METHOD_NAME`, and
+`REPETITIONS` environment variables.
+
+An explicit `--execute`, `--dry-run`, or `--preflight` is required so selecting
+a config cannot accidentally move the arm. Real method matrices are
+intentionally not run unattended: arrange the box, start autonomy, label/quit
+the run, and then launch the next method.
+
+After the evaluator exits successfully, the runner:
+
+1. identifies the one new `real_robot_runs/RUN_ID` directory;
+2. writes `RUN_ID/experiment.json` containing the exact case, method, command,
+   repository, timestamps, and exit codes;
+3. invokes `scripts/postprocess_discrete_real_run.sh` for the configured trial;
+4. records the resulting `analysis/overview_trial_NNN` path in
+   `experiment.json`.
+
+Postprocessing is automatic by default. Use `--skip-postprocess` only when the
+run is intentionally incomplete. `--fps 10` overrides output video FPS, and
+extra evaluator flags can be appended after `--`, for example:
+
+```bash
+.venv/bin/python scripts/run_real_robot_experiment.py \
+  --case test01 --method discrete_cem --execute -- \
+  --max-actions 30
+```
+
+Relative method repository paths are resolved from the `le-wm` repository;
+relative dataset-video paths are resolved inside the selected method's
+repository. This lets the same named case launch either `le-wm` or the sibling
+`discrete-la-wm` checkout.
 
 ### Offline diagnostics
 
@@ -141,6 +345,21 @@ world-model checkpoints by default. Only the first predicted state of a plan is
 directly comparable with the next real image because live MPC replans after
 every action.
 
+`render_real_latent_alignment.py` also accepts the DINO patch decoder produced
+by `train_dino_decoder.py`. It reshapes the flattened live artifacts back to
+their recorded `(256, 384)` token grid and rejects a decoder trained for a
+different world-model checkpoint:
+
+```bash
+.venv/bin/python scripts/render_real_latent_alignment.py \
+  --run real_robot_runs/RUN_ID \
+  --decoder /path/to/decoder_vqvae/decoder_best.pt
+```
+
+The heavier `replay_real_cem_latents.py` tool still reconstructs LeWM planner
+history internally and is therefore LeWM-only. DINO-WM runs should use their
+live saved `z/z_hat` artifacts with `render_real_latent_alignment.py`.
+
 The lightweight run overview does not load the model or require a decoder:
 
 ```bash
@@ -159,13 +378,23 @@ latent goal distance, and solve time. `--run` accepts either a full/relative
 run-directory path or a bare directory name found under `real_robot_runs/`.
 
 As an additional check, it also writes `tracking_check.mp4`,
-`tracking_errors.png`, and `tracking_metrics.csv`.  The box coordinate is the
-large red-patch centroid; the EE proxy is the small red pusher-tip centroid.
-The latter uses temporal continuity but remains an intentionally approximate
-visual check.  Missing detections are recorded as NaN and do not affect the
-primary video or planner-cost artifacts.  Goal-relative box and EE distances
-are kept separate and reported in image pixels.  The final sample is the last
-saved pre-action observation, not necessarily a terminal post-action frame.
+`tracking_errors.png`, and `tracking_metrics.csv`. The box pose is the centroid
+and minimum-area rectangle fitted to the large red patch. The fitted four
+corners and long-axis angle are recorded; goal-relative orientation error is
+reported in degrees modulo 180. A square-symmetric marker is still ambiguous
+modulo 90. The EE proxy is the small red pusher-tip centroid with temporal
+continuity. Missing detections are recorded as NaN and do not affect the
+primary video or planner-cost artifacts. Goal-relative box and EE distances
+remain separate and use image pixels.
+
+For new runs, `s`/`f`, automatic `at_goal`, and action-budget completion save a
+terminal frame only after robot settling and a strictly newer camera receipt.
+The raw/tracking videos append this `terminal_post_action` sample, and
+`summary.json` reports explicit terminal box-center, box-orientation, and EE
+errors plus terminal position progress. After pressing `s` or `f`, wait for
+`saved settled terminal observation` before pressing `q`; quitting remains an
+immediate safety action and can interrupt terminal capture. Legacy runs without
+a terminal frame are explicitly marked and retain last-pre-action semantics.
 
 ### Commands
 
@@ -287,7 +516,8 @@ As of July 20, 2026:
 - the epoch-146 planner loads against the artifact manifest;
 - constrained CEM outputs were verified to contain only exact keyboard-action
   vocabulary entries;
-- all 36 real-evaluation, latent-alignment, and constant-trajectory unit tests
+- all 42 real-evaluation, DINO runtime/decoder, latent-alignment, and
+  constant-trajectory unit tests
   pass.
 - dataset replay preflight loads aligned HDF5 start/goal frames and saved
   initial end-effector XY without opening the display, camera, or robot.

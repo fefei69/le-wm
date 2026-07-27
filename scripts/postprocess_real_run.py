@@ -5,11 +5,11 @@ The video places every raw planner observation beside the fixed trial goal.
 The plot uses the planner's recorded cost field, not a training loss. Each
 video frame and plot sample therefore refer to the same autonomous_step.
 
-Pixel tracking is an additional, deliberately lightweight check.  The box is
-the centroid of its large red patch; the visual EE proxy is the centroid of
-the small red pusher tip, stabilized by temporal continuity.  Missing points
-remain missing and never prevent the primary post-processing artifacts from
-being produced.
+Pixel tracking is an additional, deliberately lightweight check.  The box
+pose comes from a minimum-area rectangle around its large red patch; the
+visual EE proxy is the centroid of the small red pusher tip, stabilized by
+temporal continuity.  Missing measurements remain missing and never prevent
+the primary post-processing artifacts from being produced.
 """
 
 from __future__ import annotations
@@ -72,16 +72,23 @@ class TrialData:
     goal_path: Path
     steps: tuple[TrialStep, ...]
     outcome: str | None
+    terminal_path: Path | None
+    terminal_elapsed_s: float | None
     metadata: dict[str, Any]
 
 
 @dataclass(frozen=True)
 class TrackingData:
     goal_box: np.ndarray
+    goal_box_corners: np.ndarray
+    goal_box_orientation_deg: float
     goal_ee: np.ndarray
     box_centroids: np.ndarray
+    box_corners: np.ndarray
+    box_orientations_deg: np.ndarray
     ee_centroids: np.ndarray
     box_goal_errors: np.ndarray
+    box_orientation_goal_errors_deg: np.ndarray
     ee_goal_errors: np.ndarray
 
 
@@ -244,17 +251,43 @@ def load_trial(run: Path, trial_id: int) -> TrialData:
         )
 
     outcomes = [
-        str(event.get("outcome"))
+        event
         for event in events
         if event.get("type") == "trial_outcome"
         and int(event.get("trial_id", -1)) == trial_id
     ]
+    outcome_event = outcomes[-1] if outcomes else None
+    terminal_path = None
+    terminal_elapsed_s = None
+    if outcome_event is not None and outcome_event.get("terminal_frame") is not None:
+        terminal_path = resolve_run_artifact(
+            run_path,
+            outcome_event.get("terminal_frame"),
+            label="terminal_frame",
+        )
+        terminal_monotonic_ns = outcome_event.get("monotonic_ns")
+        if (
+            use_monotonic_time
+            and isinstance(terminal_monotonic_ns, int)
+            and terminal_monotonic_ns >= first_monotonic_ns
+        ):
+            terminal_elapsed_s = (
+                terminal_monotonic_ns - first_monotonic_ns
+            ) / 1e9
+        else:
+            terminal_elapsed_s = records[-1].elapsed_s
     return TrialData(
         run_path=run_path,
         trial_id=trial_id,
         goal_path=goal_path,
         steps=tuple(records),
-        outcome=outcomes[-1] if outcomes else None,
+        outcome=(
+            str(outcome_event.get("outcome"))
+            if outcome_event is not None
+            else None
+        ),
+        terminal_path=terminal_path,
+        terminal_elapsed_s=terminal_elapsed_s,
         metadata=metadata,
     )
 
@@ -272,8 +305,10 @@ def valid_point(point: np.ndarray) -> bool:
     return point.shape == (2,) and bool(np.isfinite(point).all())
 
 
-def detect_box_centroid(image: np.ndarray) -> np.ndarray:
-    """Return the large red box-patch centroid ``(u, v)`` or NaNs."""
+def detect_box_pose(
+    image: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Return red-patch centroid, fitted corners, and long-axis angle."""
     image_i16 = image.astype(np.int16, copy=False)
     r, g, b = image_i16[..., 0], image_i16[..., 1], image_i16[..., 2]
     for red_min, margin, minimum_area in BOX_TIERS:
@@ -282,7 +317,7 @@ def detect_box_centroid(image: np.ndarray) -> np.ndarray:
             & (r - g > margin)
             & (r - b > margin)
         ).astype(np.uint8)
-        count, _, stats, centroids = cv2.connectedComponentsWithStats(
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(
             mask, connectivity=8
         )
         if count <= 1:
@@ -290,8 +325,43 @@ def detect_box_centroid(image: np.ndarray) -> np.ndarray:
         component = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) + 1
         if stats[component, cv2.CC_STAT_AREA] < minimum_area:
             continue
-        return centroids[component].astype(np.float32)
-    return np.full(2, np.nan, dtype=np.float32)
+        component_mask = (labels == component).astype(np.uint8)
+        contours, _ = cv2.findContours(
+            component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            continue
+        rectangle = cv2.minAreaRect(max(contours, key=cv2.contourArea))
+        corners = cv2.boxPoints(rectangle).astype(np.float32)
+        edges = np.roll(corners, -1, axis=0) - corners
+        lengths = np.linalg.norm(edges, axis=1)
+        longest = int(np.argmax(lengths))
+        if not np.isfinite(lengths[longest]) or lengths[longest] < 1.0:
+            continue
+        orientation_deg = float(
+            np.degrees(np.arctan2(edges[longest, 1], edges[longest, 0]))
+            % 180.0
+        )
+        return (
+            centroids[component].astype(np.float32),
+            corners,
+            orientation_deg,
+        )
+    return (
+        np.full(2, np.nan, dtype=np.float32),
+        np.full((4, 2), np.nan, dtype=np.float32),
+        float("nan"),
+    )
+
+
+def detect_box_centroid(image: np.ndarray) -> np.ndarray:
+    """Return the large red box-patch centroid ``(u, v)`` or NaNs."""
+    return detect_box_pose(image)[0]
+
+
+def detect_box_orientation_deg(image: np.ndarray) -> float:
+    """Return the fitted red-patch long-axis angle modulo 180 degrees."""
+    return detect_box_pose(image)[2]
 
 
 def gripper_tip_candidates(image: np.ndarray) -> np.ndarray:
@@ -372,22 +442,66 @@ def goal_errors(points: np.ndarray, goal: np.ndarray) -> np.ndarray:
     return errors
 
 
+def orientation_goal_errors_deg(
+    orientations_deg: np.ndarray, goal_orientation_deg: float
+) -> np.ndarray:
+    """Return absolute long-axis angle error with 180-degree symmetry."""
+    errors = np.full(len(orientations_deg), np.nan, dtype=np.float32)
+    if not np.isfinite(goal_orientation_deg):
+        return errors
+    detected = np.isfinite(orientations_deg)
+    delta = (
+        orientations_deg[detected] - float(goal_orientation_deg) + 90.0
+    ) % 180.0 - 90.0
+    errors[detected] = np.abs(delta)
+    return errors
+
+
+def tracking_samples(
+    trial: TrialData,
+) -> list[tuple[str, int, float, Path]]:
+    samples = [
+        ("pre_action", record.step, record.elapsed_s, record.observation_path)
+        for record in trial.steps
+    ]
+    if trial.terminal_path is not None:
+        samples.append(
+            (
+                "terminal_post_action",
+                len(trial.steps),
+                float(trial.terminal_elapsed_s),
+                trial.terminal_path,
+            )
+        )
+    return samples
+
+
 def track_trial(trial: TrialData) -> TrackingData:
     """Compute optional image-space box and EE tracks for a trial."""
     goal = load_rgb(trial.goal_path)
-    frames = [load_rgb(record.observation_path) for record in trial.steps]
-    goal_box = detect_box_centroid(goal)
+    frames = [load_rgb(sample[3]) for sample in tracking_samples(trial)]
+    goal_box, goal_box_corners, goal_box_orientation_deg = detect_box_pose(goal)
     goal_ee = detect_goal_gripper_tip(goal)
-    box_centroids = np.asarray(
-        [detect_box_centroid(frame) for frame in frames], dtype=np.float32
+    box_poses = [detect_box_pose(frame) for frame in frames]
+    box_centroids = np.asarray([pose[0] for pose in box_poses], dtype=np.float32)
+    box_corners = np.asarray([pose[1] for pose in box_poses], dtype=np.float32)
+    box_orientations_deg = np.asarray(
+        [pose[2] for pose in box_poses], dtype=np.float32
     )
     ee_centroids = track_gripper_tip(frames)
     return TrackingData(
         goal_box=goal_box,
+        goal_box_corners=goal_box_corners,
+        goal_box_orientation_deg=goal_box_orientation_deg,
         goal_ee=goal_ee,
         box_centroids=box_centroids,
+        box_corners=box_corners,
+        box_orientations_deg=box_orientations_deg,
         ee_centroids=ee_centroids,
         box_goal_errors=goal_errors(box_centroids, goal_box),
+        box_orientation_goal_errors_deg=orientation_goal_errors_deg(
+            box_orientations_deg, goal_box_orientation_deg
+        ),
         ee_goal_errors=goal_errors(ee_centroids, goal_ee),
     )
 
@@ -397,7 +511,8 @@ def compose_video_frame(
     goal: np.ndarray,
     *,
     step: int,
-    cost: float,
+    cost: float | None,
+    sample_type: str = "pre_action",
 ) -> np.ndarray:
     observation = np.asarray(observation)
     goal = np.asarray(goal)
@@ -414,10 +529,20 @@ def compose_video_frame(
     canvas[HEADER_HEIGHT:, IMAGE_SHAPE[1] :] = goal
     image = Image.fromarray(canvas)
     draw = ImageDraw.Draw(image)
-    draw.text((8, 11), f"RAW OBSERVATION  step {step:03d}", fill=(255, 255, 255))
+    left_label = (
+        f"RAW OBSERVATION  step {step:03d}"
+        if sample_type == "pre_action"
+        else f"TERMINAL POST-ACTION  after step {step:03d}"
+    )
+    right_label = (
+        f"GOAL  planner cost {cost:.5g}"
+        if cost is not None
+        else "GOAL  terminal result"
+    )
+    draw.text((8, 11), left_label, fill=(255, 255, 255))
     draw.text(
         (IMAGE_SHAPE[1] + 8, 11),
-        f"GOAL  planner cost {cost:.5g}",
+        right_label,
         fill=(255, 255, 255),
     )
     return np.asarray(image)
@@ -458,17 +583,31 @@ def write_video(path: Path, trial: TrialData, fps: float) -> None:
                     cost=record.cost,
                 )
             )
+        if trial.terminal_path is not None:
+            writer.append_data(
+                compose_video_frame(
+                    load_rgb(trial.terminal_path),
+                    goal,
+                    step=len(trial.steps),
+                    cost=None,
+                    sample_type="terminal_post_action",
+                )
+            )
 
 
 def annotate_tracking(
     frame: np.ndarray,
     *,
     box: np.ndarray,
+    box_corners: np.ndarray,
     ee: np.ndarray,
 ) -> np.ndarray:
-    """Overlay the box cross and EE circle used by the tracking check."""
+    """Overlay the fitted box rectangle/center and visual EE circle."""
     image = Image.fromarray(frame.copy())
     draw = ImageDraw.Draw(image)
+    if box_corners.shape == (4, 2) and np.isfinite(box_corners).all():
+        polygon = [tuple(float(value) for value in point) for point in box_corners]
+        draw.line(polygon + [polygon[0]], fill=(70, 255, 90), width=2)
     if valid_point(box):
         u, v = (float(value) for value in box)
         draw.line((u - 5, v, u + 5, v), fill=(70, 255, 90), width=2)
@@ -483,22 +622,41 @@ def format_error(value: float, label: str) -> str:
     return f"{label} {value:.1f}px" if np.isfinite(value) else f"{label} MISS"
 
 
+def format_pose_error(position_error: float, orientation_error: float) -> str:
+    position = format_error(position_error, "box")
+    angle = (
+        f"angle {orientation_error:.1f}deg"
+        if np.isfinite(orientation_error)
+        else "angle MISS"
+    )
+    return f"{position}  {angle}"
+
+
 def compose_tracking_frame(
     observation: np.ndarray,
     goal: np.ndarray,
     *,
     step: int,
+    sample_type: str,
     observation_box: np.ndarray,
+    observation_box_corners: np.ndarray,
     observation_ee: np.ndarray,
     goal_box: np.ndarray,
+    goal_box_corners: np.ndarray,
     goal_ee: np.ndarray,
     box_error: float,
+    box_orientation_error_deg: float,
     ee_error: float,
 ) -> np.ndarray:
     observation_marked = annotate_tracking(
-        observation, box=observation_box, ee=observation_ee
+        observation,
+        box=observation_box,
+        box_corners=observation_box_corners,
+        ee=observation_ee,
     )
-    goal_marked = annotate_tracking(goal, box=goal_box, ee=goal_ee)
+    goal_marked = annotate_tracking(
+        goal, box=goal_box, box_corners=goal_box_corners, ee=goal_ee
+    )
     canvas = np.zeros(
         (IMAGE_SHAPE[0] + HEADER_HEIGHT, IMAGE_SHAPE[1] * 2, 3), dtype=np.uint8
     )
@@ -506,11 +664,16 @@ def compose_tracking_frame(
     canvas[HEADER_HEIGHT:, IMAGE_SHAPE[1] :] = goal_marked
     image = Image.fromarray(canvas)
     draw = ImageDraw.Draw(image)
-    draw.text((8, 4), f"TRACKING CHECK  step {step:03d}", fill=(255, 255, 255))
-    draw.text((8, 20), "box +   EE o", fill=(255, 255, 255))
+    sample_label = (
+        f"TRACKING CHECK  step {step:03d}"
+        if sample_type == "pre_action"
+        else f"TERMINAL  after step {step:03d}"
+    )
+    draw.text((8, 4), sample_label, fill=(255, 255, 255))
+    draw.text((8, 20), "box rectangle/+   EE o", fill=(255, 255, 255))
     draw.text(
         (IMAGE_SHAPE[1] + 8, 4),
-        format_error(box_error, "box"),
+        format_pose_error(box_error, box_orientation_error_deg),
         fill=(255, 255, 255),
     )
     draw.text(
@@ -535,17 +698,25 @@ def write_tracking_video(
         quality=8,
         macro_block_size=1,
     ) as writer:
-        for index, record in enumerate(trial.steps):
+        for index, (sample_type, step, _, frame_path) in enumerate(
+            tracking_samples(trial)
+        ):
             writer.append_data(
                 compose_tracking_frame(
-                    load_rgb(record.observation_path),
+                    load_rgb(frame_path),
                     goal,
-                    step=record.step,
+                    step=step,
+                    sample_type=sample_type,
                     observation_box=tracking.box_centroids[index],
+                    observation_box_corners=tracking.box_corners[index],
                     observation_ee=tracking.ee_centroids[index],
                     goal_box=tracking.goal_box,
+                    goal_box_corners=tracking.goal_box_corners,
                     goal_ee=tracking.goal_ee,
                     box_error=float(tracking.box_goal_errors[index]),
+                    box_orientation_error_deg=float(
+                        tracking.box_orientation_goal_errors_deg[index]
+                    ),
                     ee_error=float(tracking.ee_goal_errors[index]),
                 )
             )
@@ -576,23 +747,40 @@ def write_tracking_metrics(
         writer = csv.writer(stream)
         writer.writerow(
             [
+                "sample_type",
                 "step",
                 "elapsed_s",
                 "box_u_px",
                 "box_v_px",
+                "box_orientation_deg",
                 "box_goal_error_px",
+                "box_goal_orientation_error_deg",
+                "box_corner_0_u_px",
+                "box_corner_0_v_px",
+                "box_corner_1_u_px",
+                "box_corner_1_v_px",
+                "box_corner_2_u_px",
+                "box_corner_2_v_px",
+                "box_corner_3_u_px",
+                "box_corner_3_v_px",
                 "ee_u_px",
                 "ee_v_px",
                 "ee_goal_error_px",
             ]
         )
-        for index, record in enumerate(trial.steps):
+        for index, (sample_type, step, elapsed_s, _) in enumerate(
+            tracking_samples(trial)
+        ):
             writer.writerow(
                 [
-                    record.step,
-                    record.elapsed_s,
+                    sample_type,
+                    step,
+                    elapsed_s,
                     *tracking.box_centroids[index],
+                    tracking.box_orientations_deg[index],
                     tracking.box_goal_errors[index],
+                    tracking.box_orientation_goal_errors_deg[index],
+                    *tracking.box_corners[index].reshape(-1),
                     *tracking.ee_centroids[index],
                     tracking.ee_goal_errors[index],
                 ]
@@ -619,25 +807,36 @@ def write_loss_plot(path: Path, trial: TrialData) -> None:
 def write_tracking_plot(
     path: Path, trial: TrialData, tracking: TrackingData
 ) -> None:
-    elapsed = np.asarray([record.elapsed_s for record in trial.steps])
-    figure, axes = plt.subplots(2, 1, figsize=(7.5, 6.4), sharex=True)
+    elapsed = np.asarray([sample[2] for sample in tracking_samples(trial)])
+    figure, axes = plt.subplots(3, 1, figsize=(7.5, 8.2), sharex=True)
     series = (
-        ("Box", tracking.box_goal_errors, "#3d8b57"),
-        ("EE / red pusher tip", tracking.ee_goal_errors, "#268b9c"),
+        ("Box center", tracking.box_goal_errors, "px", "#3d8b57"),
+        (
+            "Box orientation",
+            tracking.box_orientation_goal_errors_deg,
+            "deg",
+            "#8a6d3b",
+        ),
+        ("EE / red pusher tip", tracking.ee_goal_errors, "px", "#268b9c"),
     )
-    for axis, (label, errors, color) in zip(axes, series):
+    for axis, (label, errors, units, color) in zip(axes, series):
         detected = np.isfinite(errors)
         if detected.any():
             axis.plot(
                 elapsed[detected], errors[detected], marker="o",
                 markersize=3, linewidth=1.4, color=color,
             )
+            if trial.terminal_path is not None and np.isfinite(errors[-1]):
+                axis.scatter(
+                    elapsed[-1], errors[-1], marker="X", s=60,
+                    color=color, edgecolors="black", linewidths=0.5, zorder=3,
+                )
         else:
             axis.text(
                 0.5, 0.5, "no valid goal-relative detections",
                 ha="center", va="center", transform=axis.transAxes,
             )
-        axis.set_ylabel(f"{label} error (px)")
+        axis.set_ylabel(f"{label} error ({units})")
         axis.grid(alpha=0.25)
     axes[-1].set_xlabel("elapsed wall time from first planned action (s)")
     title = f"Optional pixel tracking check — trial {trial.trial_id:03d}"
@@ -653,11 +852,26 @@ def optional_float(value: float) -> float | None:
     return float(value) if np.isfinite(value) else None
 
 
+def terminal_progress(errors: np.ndarray, terminal_available: bool) -> float | None:
+    if not terminal_available or not len(errors):
+        return None
+    start = float(errors[0])
+    terminal = float(errors[-1])
+    if not np.isfinite(start) or start <= 0.0 or not np.isfinite(terminal):
+        return None
+    return float((start - terminal) / start)
+
+
 def tracking_metric_summary(
-    points: np.ndarray, goal: np.ndarray, errors: np.ndarray
+    points: np.ndarray,
+    goal: np.ndarray,
+    errors: np.ndarray,
+    *,
+    terminal_available: bool,
 ) -> dict[str, Any]:
     detected = np.isfinite(points).all(axis=1)
     valid_errors = errors[np.isfinite(errors)]
+    last_pre_action_index = -2 if terminal_available else -1
     return {
         "goal_detected": valid_point(goal),
         "detection_rate": float(detected.mean()),
@@ -666,7 +880,47 @@ def tracking_metric_summary(
             optional_float(float(valid_errors.min())) if len(valid_errors) else None
         ),
         "final_error_px": optional_float(float(errors[-1])),
+        "last_pre_action_error_px": optional_float(
+            float(errors[last_pre_action_index])
+        ),
+        "terminal_error_px": (
+            optional_float(float(errors[-1])) if terminal_available else None
+        ),
+        "terminal_progress_fraction": terminal_progress(
+            errors, terminal_available
+        ),
         "last_valid_error_px": (
+            optional_float(float(valid_errors[-1])) if len(valid_errors) else None
+        ),
+    }
+
+
+def orientation_metric_summary(
+    orientations_deg: np.ndarray,
+    goal_orientation_deg: float,
+    errors_deg: np.ndarray,
+    *,
+    terminal_available: bool,
+) -> dict[str, Any]:
+    detected = np.isfinite(orientations_deg)
+    valid_errors = errors_deg[np.isfinite(errors_deg)]
+    last_pre_action_index = -2 if terminal_available else -1
+    return {
+        "goal_orientation_detected": bool(np.isfinite(goal_orientation_deg)),
+        "goal_orientation_deg": optional_float(float(goal_orientation_deg)),
+        "orientation_detection_rate": float(detected.mean()),
+        "start_orientation_error_deg": optional_float(float(errors_deg[0])),
+        "best_orientation_error_deg": (
+            optional_float(float(valid_errors.min())) if len(valid_errors) else None
+        ),
+        "final_orientation_error_deg": optional_float(float(errors_deg[-1])),
+        "last_pre_action_orientation_error_deg": optional_float(
+            float(errors_deg[last_pre_action_index])
+        ),
+        "terminal_orientation_error_deg": (
+            optional_float(float(errors_deg[-1])) if terminal_available else None
+        ),
+        "last_valid_orientation_error_deg": (
             optional_float(float(valid_errors[-1])) if len(valid_errors) else None
         ),
     }
@@ -700,14 +954,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_tracking_video(tracking_video_path, trial, tracking, fps)
     write_tracking_plot(tracking_plot_path, trial, tracking)
     write_tracking_metrics(tracking_metrics_path, trial, tracking)
+    terminal_available = trial.terminal_path is not None
     box_tracking_summary = tracking_metric_summary(
-        tracking.box_centroids, tracking.goal_box, tracking.box_goal_errors
+        tracking.box_centroids,
+        tracking.goal_box,
+        tracking.box_goal_errors,
+        terminal_available=terminal_available,
+    )
+    box_tracking_summary.update(
+        orientation_metric_summary(
+            tracking.box_orientations_deg,
+            tracking.goal_box_orientation_deg,
+            tracking.box_orientation_goal_errors_deg,
+            terminal_available=terminal_available,
+        )
     )
     ee_tracking_summary = tracking_metric_summary(
-        tracking.ee_centroids, tracking.goal_ee, tracking.ee_goal_errors
+        tracking.ee_centroids,
+        tracking.goal_ee,
+        tracking.ee_goal_errors,
+        terminal_available=terminal_available,
     )
     summary = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_run": str(trial.run_path),
         "trial_id": trial.trial_id,
         "outcome": trial.outcome,
@@ -718,12 +987,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "goal_frame": "fixed goal recorded by trial_started",
             "planning_loss": "autonomous_step.cost, the planner objective, not training loss",
             "elapsed_s": "autonomous_step monotonic time relative to the first step",
-            "box_tracking": "centroid of the large red box patch in each saved image",
+            "box_tracking": "centroid and minimum-area-rectangle long axis of the large red box patch",
+            "box_orientation": "image-plane long-axis angle in degrees modulo 180; square-symmetric markers remain ambiguous modulo 90",
             "ee_tracking": "centroid of the small red pusher tip with temporal continuity; optional QA only",
-            "tracking_endpoint": "last saved pre-action observation, not a guaranteed post-final-action frame",
+            "tracking_endpoint": (
+                "settled terminal post-action observation"
+                if terminal_available
+                else "legacy last pre-action observation; no terminal frame was recorded"
+            ),
         },
         "tracking": {
             "units": "image_pixels",
+            "orientation_units": "degrees_modulo_180",
+            "terminal_frame_available": terminal_available,
             "box": box_tracking_summary,
             "ee": ee_tracking_summary,
         },
@@ -745,9 +1021,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         "tracking check: "
         f"box detection {box_tracking_summary['detection_rate']:.1%}, "
-        f"last error {box_tracking_summary['last_valid_error_px']}; "
+        f"endpoint position {box_tracking_summary['final_error_px']} px, "
+        f"orientation {box_tracking_summary['final_orientation_error_deg']} deg; "
         f"EE detection {ee_tracking_summary['detection_rate']:.1%}, "
-        f"last error {ee_tracking_summary['last_valid_error_px']}"
+        f"endpoint position {ee_tracking_summary['final_error_px']} px; "
+        f"terminal={'yes' if terminal_available else 'no'}"
     )
     print(f"tracking video: {tracking_video_path}")
     print(f"tracking plot: {tracking_plot_path}")

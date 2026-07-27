@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 import imageio.v3 as iio
+import cv2
 import numpy as np
 
 from scripts.postprocess_real_run import (
@@ -11,10 +12,13 @@ from scripts.postprocess_real_run import (
     compose_video_frame,
     default_fps,
     detect_box_centroid,
+    detect_box_pose,
     detect_goal_gripper_tip,
     load_trial,
+    orientation_goal_errors_deg,
     resolve_run_path,
     track_gripper_tip,
+    tracking_samples,
 )
 
 
@@ -32,6 +36,27 @@ class PostprocessRealRunTests(unittest.TestCase):
 
         np.testing.assert_allclose(detect_box_centroid(frame), (142, 99.5), atol=1)
         np.testing.assert_allclose(detect_goal_gripper_tip(frame), (80, 72.5), atol=1)
+
+    def test_box_pose_fits_corners_and_long_axis_modulo_180(self):
+        frame = np.full((224, 224, 3), 180, dtype=np.uint8)
+        expected_center = np.array([125.0, 105.0], dtype=np.float32)
+        expected_angle_deg = 32.0
+        corners = cv2.boxPoints(
+            ((float(expected_center[0]), float(expected_center[1])), (42.0, 8.0), expected_angle_deg)
+        )
+        cv2.fillConvexPoly(
+            frame, np.rint(corners).astype(np.int32), (150, 60, 50)
+        )
+
+        center, fitted_corners, orientation_deg = detect_box_pose(frame)
+        angle_error = orientation_goal_errors_deg(
+            np.asarray([orientation_deg], dtype=np.float32), expected_angle_deg
+        )[0]
+
+        np.testing.assert_allclose(center, expected_center, atol=1.0)
+        self.assertEqual(fitted_corners.shape, (4, 2))
+        self.assertTrue(np.isfinite(fitted_corners).all())
+        self.assertLess(float(angle_error), 2.0)
 
     def test_gripper_track_uses_continuity_to_reject_lower_distractor(self):
         first = self.tracking_frame(80, 72)
@@ -65,6 +90,8 @@ class PostprocessRealRunTests(unittest.TestCase):
             iio.imwrite(frames_path / "trial_001_goal.png", goal)
             iio.imwrite(frames_path / "trial_001_step_001.png", first)
             iio.imwrite(frames_path / "trial_001_step_002.png", second)
+            terminal = np.full((224, 224, 3), 30, dtype=np.uint8)
+            iio.imwrite(frames_path / "trial_001_terminal.png", terminal)
             (run_path / "metadata.json").write_text(
                 json.dumps(
                     {"artifact_manifest": {"runtime": {"tick_hz": 7.0}}}
@@ -96,7 +123,13 @@ class PostprocessRealRunTests(unittest.TestCase):
                     "goal_distance": 2.5,
                     "solve_time_s": 0.3,
                 },
-                {"type": "trial_outcome", "trial_id": 1, "outcome": "success"},
+                {
+                    "type": "trial_outcome",
+                    "trial_id": 1,
+                    "outcome": "success",
+                    "monotonic_ns": 3_000_000_000,
+                    "terminal_frame": "frames/trial_001_terminal.png",
+                },
             ]
             (run_path / "events.jsonl").write_text(
                 "".join(json.dumps(event) + "\n" for event in events)
@@ -109,6 +142,12 @@ class PostprocessRealRunTests(unittest.TestCase):
                 [record.elapsed_s for record in trial.steps], [0.0, 1.5]
             )
             self.assertEqual(trial.outcome, "success")
+            self.assertEqual(trial.terminal_path, (frames_path / "trial_001_terminal.png").resolve())
+            self.assertEqual(trial.terminal_elapsed_s, 2.0)
+            samples = tracking_samples(trial)
+            self.assertEqual(samples[-1][0], "terminal_post_action")
+            self.assertEqual(samples[-1][1], 2)
+            self.assertEqual(samples[-1][2], 2.0)
             self.assertEqual(default_fps(trial.metadata), 7.0)
 
             composed = compose_video_frame(first, goal, step=1, cost=2.0)

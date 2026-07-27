@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "trial_id": 1,
+    "postprocess_args": []
+  },
+  "cases": {
+  "test01": {
+    "dataset_episode": "datasets_videos/20260715_180541/ep_005.mp4",
+    "initial_step": 80,
+    "goal_step": 160
+  },
+  "test02": {
+    "dataset_episode": "datasets_videos/20260715_180541/ep_014.mp4",
+    "initial_step": 21,
+    "goal_step": 50
+  },
+  "test03": {
+    "dataset_episode": "datasets_videos/20260715_180541/ep_003.mp4",
+    "initial_step": 10,
+    "goal_step": 80
+  },
+  "test04": {
+    "dataset_episode": "datasets_videos/20260714_181139/ep_015.mp4",
+    "initial_step": 41,
+    "goal_step": 59
+  },
+  "test05": {
+    "dataset_episode": "datasets_videos/20260715_164320/ep_010.mp4",
+    "initial_step": 165,
+    "goal_step": 211
+  }
+  },
+  "methods": {
+    "lewm_cem": {
+      "adapter": "lewm",
+      "repo": ".",
+      "world_model": "lewm",
+      "solver": "cem",
+      "extra_args": [
+        "--action-mode",
+        "keyboard",
+        "--horizon",
+        "5",
+        "--num-samples",
+        "1024",
+        "--iterations",
+        "20",
+        "--elite-count",
+        "128"
+      ]
+    },
+    "dinowm_categorical_cem": {
+      "adapter": "lewm",
+      "repo": ".",
+      "world_model": "dinowm",
+      "solver": "categorical-cem",
+      "extra_args": [
+        "--action-mode",
+        "keyboard",
+        "--horizon",
+        "5",
+        "--num-samples",
+        "64",
+        "--iterations",
+        "3",
+        "--elite-count",
+        "8",
+        "--cem-batch-size",
+        "32",
+        "--planner-timeout",
+        "10",
+        "--max-plan-age",
+        "10"
+      ]
+    },
+    "discrete_cem": {
+      "adapter": "discrete",
+      "repo": "../discrete-la-wm",
+      "world_model": "discrete_e2_1",
+      "solver": "discrete-cem",
+      "extra_args": [
+        "--horizon",
+        "5",
+        "--replan-every",
+        "1",
+        "--cost-mode",
+        "settle_smooth",
+        "--cost-c",
+        "0.5",
+        "--cost-lambda",
+        "0.0"
+      ]
+    },
+    "discrete_mcts": {
+      "adapter": "discrete",
+      "repo": "../discrete-la-wm",
+      "world_model": "discrete_e2_1",
+      "solver": "mcts",
+      "extra_args": [
+        "--horizon",
+        "5",
+        "--replan-every",
+        "1",
+        "--cost-mode",
+        "settle_smooth",
+        "--cost-c",
+        "0.5",
+        "--cost-lambda",
+        "0.0"
+      ]
+    }
+  }
+}
