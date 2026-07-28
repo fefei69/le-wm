@@ -258,8 +258,24 @@ The checked-in methods cover:
 
 - `lewm_cem`
 - `dinowm_categorical_cem`
-- `discrete_cem`
-- `discrete_mcts`
+- `dinowm_cem` — Gaussian CEM with the same H5, 64x3, top-8 budget
+- `discrete_cem` — H5/r1 with `settle_smooth(c=0.5, lambda=0)`
+- `discrete_mcts` — H5/r1 with `settle_smooth(c=0.5, lambda=0)`
+- `discrete_mcts_endpoint` — H5/r1 with endpoint `latent_mse`
+- `discrete_cem_r5` — H5/r5 with endpoint `latent_mse`
+- `discrete_mcts_r5` — H5/r5 with endpoint `latent_mse`
+
+The two DINO-WM methods use the same keyboard action set, horizon, sample count,
+iteration count, elite count, and candidate batch size. This isolates Gaussian
+versus categorical CEM rather than changing the planning budget or action space.
+
+The default cadence-cost pairing is intentional: r1 `settle_smooth` scores every
+imagined waypoint to encourage immediate progress, whereas the r5 methods use
+the validated endpoint-only squared latent distance for a committed five-step
+plan. `discrete_mcts_endpoint` is the explicit objective ablation: it still
+replans after every executed action, but each new H5 search scores only its
+predicted endpoint. This separates the effect of endpoint cost from the effect
+of committing all five actions.
 
 List the registry or verify one combination without hardware:
 
@@ -286,7 +302,7 @@ Run multiple independent repetitions of one case/method with the wrapper:
 ```bash
 scripts/run_real_robot_repetitions.sh \
   --case test01 \
-  --method discrete_mcts \
+  --method discrete_mcts_r5 \
   --repetitions 5 \
   --execute
 ```
@@ -332,6 +348,7 @@ repository. This lets the same named case launch either `le-wm` or the sibling
 | Tool | Purpose |
 | --- | --- |
 | `scripts/postprocess_real_run.py` | Create a side-by-side raw-observation/goal MP4, plot recorded planner cost, and add optional box/EE pixel-tracking checks for one trial. |
+| `scripts/analyze_real_robot_benchmark.py` | Verify named-experiment settings and aggregate both repositories into per-case figures, balanced cross-case tables, MCTS ablations, threshold diagnostics, and a failure audit. |
 | `scripts/replay_real_cem_latents.py` | Re-encode recorded PNGs, reconstruct planner history, replay each selected CEM plan, decode every predicted horizon state, and report predicted-versus-real one-step errors. |
 | `scripts/render_real_latent_alignment.py` | Decode saved live `z`/`z_hat` arrays and create the three-row time-aligned raw/encoded/predicted figure. |
 | `scripts/probe_pushbox_latent_rollout.py` | Apply a constant synthetic XY action from one real image and decode the open-loop latent trajectory. |
@@ -367,6 +384,21 @@ The lightweight run overview does not load the model or require a decoder:
   --run RUN_ID \
   --trial-id 1
 ```
+
+Aggregate the named real-robot repetitions from this repository and the sibling
+`discrete-la-wm` checkout with:
+
+```bash
+.venv/bin/python scripts/analyze_real_robot_benchmark.py
+```
+
+The default benchmark includes `test01`, `test02`, `test04`, and `test05`, uses
+the latest three timestamped attempts per case/method, omits unrun
+`discrete_cem_r5`, and keeps the earlier extra `test04` endpoint-MCTS attempt in
+the failure audit rather than the main three-run aggregate. Outputs are written
+to `outputs/real_robot_benchmark/`. Non-terminal attempts remain in continuous
+metrics using their marked last pre-action observation, but conservative
+threshold-success curves count them as failures.
 
 It writes `raw_vs_goal.mp4`, `planning_loss.png`,
 `planning_metrics.csv`, and `summary.json` under

@@ -74,6 +74,30 @@
         "10"
       ]
     },
+    "dinowm_cem": {
+      "adapter": "lewm",
+      "repo": ".",
+      "world_model": "dinowm",
+      "solver": "cem",
+      "extra_args": [
+        "--action-mode",
+        "keyboard",
+        "--horizon",
+        "5",
+        "--num-samples",
+        "64",
+        "--iterations",
+        "3",
+        "--elite-count",
+        "8",
+        "--cem-batch-size",
+        "32",
+        "--planner-timeout",
+        "10",
+        "--max-plan-age",
+        "10"
+      ]
+    },
     "discrete_cem": {
       "adapter": "discrete",
       "repo": "../discrete-la-wm",
@@ -108,6 +132,48 @@
         "0.5",
         "--cost-lambda",
         "0.0"
+      ]
+    },
+    "discrete_mcts_endpoint": {
+      "adapter": "discrete",
+      "repo": "../discrete-la-wm",
+      "world_model": "discrete_e2_1",
+      "solver": "mcts",
+      "extra_args": [
+        "--horizon",
+        "5",
+        "--replan-every",
+        "1",
+        "--cost-mode",
+        "latent_mse"
+      ]
+    },
+    "discrete_cem_r5": {
+      "adapter": "discrete",
+      "repo": "../discrete-la-wm",
+      "world_model": "discrete_e2_1",
+      "solver": "discrete-cem",
+      "extra_args": [
+        "--horizon",
+        "5",
+        "--replan-every",
+        "5",
+        "--cost-mode",
+        "latent_mse"
+      ]
+    },
+    "discrete_mcts_r5": {
+      "adapter": "discrete",
+      "repo": "../discrete-la-wm",
+      "world_model": "discrete_e2_1",
+      "solver": "mcts",
+      "extra_args": [
+        "--horizon",
+        "5",
+        "--replan-every",
+        "5",
+        "--cost-mode",
+        "latent_mse"
       ]
     }
   }
